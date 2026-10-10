@@ -24,11 +24,13 @@ lore-aws = { workspace = true }
 lore-base = { workspace = true }
 lore-revision = { workspace = true }
 lore-storage = { workspace = true }
+# Only for the nonce a state row carries: it is a value no other writer will pick for the same
+# move, so drawing it is all this crate needs from a random source.
+rand = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-rand = { workspace = true }
 # The integration tests run against real servers, whose failures the store can only describe by
 # logging: a `StoreError` says `Disconnected` and nothing more. Without a subscriber those events
 # go nowhere, so this is a dev-dependency rather than a runtime one.

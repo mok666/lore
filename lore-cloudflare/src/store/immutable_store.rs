@@ -16,8 +16,10 @@
 //!   the window when an association is visible and the bytes are about to go (see the resolution
 //!   methods below).
 //! - `fragment_state` says where a hash is in its lifecycle — stored, being obliterated, or
-//!   obliterated. It holds no representation, so it cannot disagree with the object, and it is what
-//!   answers "is this durable" in one statement without an R2 request.
+//!   obliterated — and carries the mark of the write that moved it last. It holds no
+//!   representation, so it cannot disagree with the object, and it is what answers "is this
+//!   durable" in one statement without an R2 request; the mark is what answers "was this move
+//!   mine" when an answer was lost.
 //!
 //! Three differences from the AWS store are deliberate, and each is a property of the services
 //! rather than a simplification:
@@ -100,23 +102,28 @@ use crate::turso::retry::with_deadline;
 const EXISTS_SQL: &str =
     "SELECT 1 FROM fragments WHERE hash = ?1 AND repository_context = ?2 LIMIT 1";
 
-/// The lifecycle state of one hash. No row means the hash is unknown, not that it is missing: an
-/// obliterated hash has a row, so the difference between "never stored" and "destroyed" survives.
-const LOAD_STATE_SQL: &str = "SELECT state FROM fragment_state WHERE hash = ?1";
+/// The lifecycle state of one hash, and the mark the write that moved it last left. No row means
+/// the hash is unknown, not that it is missing: an obliterated hash has a row, so the difference
+/// between "never stored" and "destroyed" survives.
+const LOAD_STATE_SQL: &str = "SELECT state, nonce FROM fragment_state WHERE hash = ?1";
 
 /// Record a hash as stored, unless something is already holding it.
 ///
 /// The insert is conditional, so it can never overwrite an obliteration's mark: a racing writer
-/// loses the insert, reads the row, and sees the mark.
-const PUBLISH_STATE_SQL: &str = "INSERT INTO fragment_state (hash, state) VALUES (?1, ?2) \
+/// loses the insert, reads the row, and sees the mark. The mark it carries is a fresh one like
+/// every other, and a row that was already there keeps the mark it has.
+const PUBLISH_STATE_SQL: &str = "INSERT INTO fragment_state (hash, state, nonce) VALUES (?1, ?2, ?3) \
      ON CONFLICT (hash) DO NOTHING";
 
-/// Move a state row, when it is still in the state the caller read.
+/// Move a state row, when it is still in the state the caller read, and leave a mark of this
+/// writer's own.
 ///
 /// Obliteration takes and releases its mark with this, so two obliterations racing for the same
-/// hash cannot both believe they hold it.
+/// hash cannot both believe they hold it. The mark is what makes that true when an answer is lost:
+/// the row a first, unanswered attempt moved and the row another writer moved hold the same state,
+/// and only the mark says whose move it was (spec §4.6).
 const ADVANCE_STATE_SQL: &str =
-    "UPDATE fragment_state SET state = ?3 WHERE hash = ?1 AND state = ?2";
+    "UPDATE fragment_state SET state = ?3, nonce = ?4 WHERE hash = ?1 AND state = ?2";
 
 /// Remove a state row, but only while it still describes a payload that is merely stored.
 ///
@@ -153,6 +160,22 @@ const HAS_PARTITION_ASSOCIATION_SQL: &str = "SELECT 1 FROM fragments WHERE hash 
 /// once gets one statement; a caller that asks about more gets several, and neither has to know
 /// which.
 pub const BATCH_ADDRESSES: usize = 64;
+
+/// How many bytes the mark on a state row is.
+///
+/// Nothing reads it for what it means: it is compared for equality against the marks one call
+/// wrote, so its only requirement is that two writers issuing the same move do not draw the same
+/// one.
+const NONCE_BYTES: usize = 16;
+
+/// A mark no other writer will draw for the same move.
+///
+/// A state row keeps the mark of the write that moved it last, so the writer that lost the answer
+/// to its own move can recognise that move — and so a writer whose move never arrived sees the
+/// mark somebody else left rather than mistaking it for its own (spec §4.6).
+fn new_nonce() -> [u8; NONCE_BYTES] {
+    rand::random()
+}
 
 /// Lower bound on the obliteration drain, whatever the configured operation deadline is.
 ///
@@ -555,6 +578,21 @@ impl CloudflareImmutableStore {
 
     /// The lifecycle state of a hash, where a row exists.
     async fn load_state(&self, hash: Hash) -> Result<Option<FragmentState>, StoreError> {
+        Ok(self
+            .load_state_and_nonce(hash)
+            .await?
+            .map(|(state, _nonce)| state))
+    }
+
+    /// The lifecycle state of a hash and the mark the write that moved it last left, where a row
+    /// exists.
+    ///
+    /// The mark is read only by [`Self::advance_state`], and only to tell a move this call made
+    /// from one somebody else made; every other caller asks for the state alone.
+    async fn load_state_and_nonce(
+        &self,
+        hash: Hash,
+    ) -> Result<Option<(FragmentState, [u8; NONCE_BYTES])>, StoreError> {
         let rows = self
             .query(
                 LOAD_STATE_SQL,
@@ -567,10 +605,10 @@ impl CloudflareImmutableStore {
             return Ok(None);
         };
 
-        Ok(Some(state_from_cell(
-            "state",
-            cell(row, 0, LOAD_STATE_SQL)?,
-        )?))
+        Ok(Some((
+            state_from_cell("state", cell(row, 0, LOAD_STATE_SQL)?)?,
+            nonce_from_cell("nonce", cell(row, 1, LOAD_STATE_SQL)?)?,
+        )))
     }
 
     /// Record that a payload exists, without disturbing an obliteration that may hold the hash.
@@ -586,6 +624,7 @@ impl CloudflareImmutableStore {
                 vec![
                     hash_blob(&hash),
                     Value::Integer(i64::from(FragmentState::Stored.bits())),
+                    Value::Blob(new_nonce().to_vec()),
                 ],
                 "publishing a fragment state",
             )
@@ -611,41 +650,41 @@ impl CloudflareImmutableStore {
     /// read sees in the target state, exactly as another writer's move would leave it.
     ///
     /// So a lost answer is reissued, and that is what makes the loss recoverable (spec §4.6): the
-    /// reissue is a fresh attempt at the same condition, and the row it did not move is a row the
-    /// unanswered attempt moved. Accepting the target state after a reissue keeps the mark an
-    /// obliteration takes exclusive in the ordinary case, where the statement reports what it did:
-    /// a plain conflict is still a conflict, and `revive_state`, which shares this statement, is
-    /// unaffected. A writer that lost its answer while another writer took the mark sees the same
-    /// target state and proceeds; the mark itself is one row, and the move that ends the
-    /// obliteration is a compare-and-set of its own, so the two do the same work rather than
-    /// disagreeing about the state.
+    /// reissue is a fresh attempt at the same condition, and the row it did not move is a row an
+    /// earlier attempt may have moved. What decides between the two is the mark, not the state: a
+    /// row in the target state says only that somebody moved it there, and that is exactly what
+    /// another obliteration's mark leaves. A writer that lost its answer while another writer took
+    /// the mark therefore stops here, which is what keeps an obliteration's hold exclusive — the
+    /// state alone would let two obliterations both believe they hold it. `revive_state`, which
+    /// shares this statement, reads the state itself for the disagreement it means to tolerate.
     async fn advance_state(
         &self,
         hash: Hash,
         expected: FragmentState,
         updated: FragmentState,
     ) -> Result<(), StoreError> {
-        let parameters = vec![
-            hash_blob(&hash),
-            Value::Integer(i64::from(expected.bits())),
-            Value::Integer(i64::from(updated.bits())),
-        ];
-
         // Not `retry_within_deadline!`: that macro reports whatever the last attempt reported,
-        // and this statement has to know whether it ran again.
-        let (moved, reissued) = with_deadline(self.limits.timeout, async {
+        // and this statement has to know whether it ran again, and which marks it wrote.
+        let (moved, nonces) = with_deadline(self.limits.timeout, async {
             let mut waiter = self.limits.retry.waiter();
-            let mut reissued = false;
+            let mut nonces: Vec<[u8; NONCE_BYTES]> = Vec::new();
 
             loop {
-                match self
-                    .executor
-                    .execute(ADVANCE_STATE_SQL, parameters.clone())
-                    .await
-                {
-                    Ok(moved) => break Ok((moved, reissued)),
+                // Every attempt carries a mark of its own: the row an attempt moved keeps the
+                // mark of that attempt, which is the only way to recognise it afterwards.
+                let nonce = new_nonce();
+                nonces.push(nonce);
+
+                let parameters = vec![
+                    hash_blob(&hash),
+                    Value::Integer(i64::from(expected.bits())),
+                    Value::Integer(i64::from(updated.bits())),
+                    Value::Blob(nonce.to_vec()),
+                ];
+
+                match self.executor.execute(ADVANCE_STATE_SQL, parameters).await {
+                    Ok(moved) => break Ok((moved, nonces)),
                     Err(error) if error.is_disconnected() && waiter.wait().await => {
-                        reissued = true;
                         warn!(%hash, reason = %error.message(), "reissuing the fragment state move");
                     }
                     Err(error) => break Err(error),
@@ -659,8 +698,15 @@ impl CloudflareImmutableStore {
             return Ok(());
         }
 
-        if reissued && self.load_state(hash).await? == Some(updated) {
-            debug!(%hash, "the reissued fragment state move found the state moved already");
+        // Only an earlier attempt of this call can have moved it: the reissue is the first report
+        // that this call did not move anything, and a row already in the target state that carries
+        // no mark of ours is another writer's move.
+        if nonces.len() > 1
+            && let Some((state, nonce)) = self.load_state_and_nonce(hash).await?
+            && state == updated
+            && nonces.contains(&nonce)
+        {
+            debug!(%hash, "the reissued fragment state move found the mark it wrote");
             return Ok(());
         }
 
@@ -697,8 +743,10 @@ impl CloudflareImmutableStore {
     /// to stop, and that is a back-off rather than an error because the mark is transient.
     ///
     /// This tolerance belongs here rather than in [`Self::advance_state`], which is also how an
-    /// obliteration takes its mark — treating "already in the target state" as success there would
-    /// let two obliterations both believe they hold it.
+    /// obliteration takes its mark: that one reports a conflict unless the row carries a move this
+    /// call wrote, because accepting "already in the target state" there would let two
+    /// obliterations both believe they hold it. A revive that lost the race reads the state here
+    /// instead, where two revives agreeing about the result is the ordinary outcome.
     async fn revive_state(&self, hash: Hash) -> Result<(), StoreError> {
         if self
             .advance_state(hash, FragmentState::Obliterated, FragmentState::Stored)
@@ -1158,6 +1206,23 @@ fn state_from_cell(column: &str, value: &Value) -> Result<FragmentState, StoreEr
         }
         other => Err(StoreError::internal(format!(
             "column {column} was {other:?}, not a fragment state"
+        ))),
+    }
+}
+
+/// A state row's `nonce` column as the mark it holds.
+///
+/// The length is a property of the table this build writes, so a row of another shape is an error
+/// rather than a mark that merely never matches.
+fn nonce_from_cell(column: &str, value: &Value) -> Result<[u8; NONCE_BYTES], StoreError> {
+    match value {
+        Value::Blob(bytes) if bytes.len() == NONCE_BYTES => {
+            let mut nonce = [0u8; NONCE_BYTES];
+            nonce.copy_from_slice(bytes);
+            Ok(nonce)
+        }
+        other => Err(StoreError::internal(format!(
+            "column {column} was {other:?}, not a {NONCE_BYTES}-byte mark"
         ))),
     }
 }
