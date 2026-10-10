@@ -5,21 +5,36 @@
 //!
 //! # Running them
 //!
-//! The tests reach a local libSQL server, which needs no token, so nothing secret is involved and
-//! the same commands work on a laptop and in CI. The server the plan names is
-//! `ghcr.io/tursodatabase/libsql-server:v0.24.32`:
+//! The tests reach a local libSQL server, which needs no token, and a local S3 endpoint, which is
+//! `MinIO` with the credentials the upstream compose file gives it, so nothing secret is involved
+//! and the same commands work on a laptop and in CI. The servers the plan names are
+//! `ghcr.io/tursodatabase/libsql-server:v0.24.32` and `cgr.dev/chainguard/minio`, which the
+//! upstream compose file (`lore-integration-tests/compose.yaml`) already starts:
 //!
 //! ```text
 //! docker network create lore-test
+//! docker run -d --name lore-minio --network lore-test --network-alias minio \
+//!   -e MINIO_ROOT_USER=lorelocal -e MINIO_ROOT_PASSWORD=lorelocal \
+//!   cgr.dev/chainguard/minio server --console-address :9001 /data
 //! docker run -d --name lore-sqld --network lore-test --network-alias sqld \
 //!   -v lore-sqld-data:/var/lib/sqld ghcr.io/tursodatabase/libsql-server:v0.24.32
 //! docker run --rm --network lore-test -v "$PWD:/work" -v lore-cargo-registry:/usr/local/cargo/registry \
-//!   -v lore-target:/work/target -w /work -e LORE_TURSO_URL=http://sqld:8080 \
-//!   rust:1.97.1 cargo test -p lore-cloudflare --tests
+//!   -v lore-target:/work/target -w /work \
+//!   -e LORE_TURSO_URL=http://sqld:8080 \
+//!   -e LORE_R2_ENDPOINT_URL=http://minio:9000 -e LORE_R2_BUCKET=lore-immutable-store-test \
+//!   -e LORE_R2_ACCESS_KEY_ID=lorelocal -e LORE_R2_SECRET_ACCESS_KEY=lorelocal \
+//!   rust:1.97.1 cargo test -p lore-cloudflare --features integration_tests --tests
 //! ```
 //!
-//! Without `LORE_TURSO_URL` every test in these files says it did not run and returns, so that a
+//! The R2 variables are the ones the plugin resolves, not test-only ones: the safe rehearsal and
+//! the real measurement differ only in the values handed to them (spec §5.3), so a variable that
+//! exists only in a test would be one more thing to get wrong. Without `LORE_TURSO_URL` or
+//! `LORE_R2_ENDPOINT_URL` every test in these files says it did not run and returns, so that a
 //! checkout without a server still has a green `cargo test`.
+//!
+//! The endpoints are the only thing this module makes for itself: a bucket that is not there yet is
+//! created, which on `MinIO` is every bucket the first time. Nothing is dropped afterwards — the
+//! content is addressed by a hash nobody else picks, so leftovers cost disk and nothing else.
 
 #![allow(dead_code)]
 
@@ -31,8 +46,13 @@ use async_trait::async_trait;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
+use lore_cloudflare::CloudflareImmutableStore;
+use lore_cloudflare::CloudflareImmutableStoreSettings;
 use lore_cloudflare::CloudflareLockStore;
 use lore_cloudflare::CloudflareMutableStore;
+use lore_cloudflare::R2Client;
+use lore_cloudflare::R2Credentials;
+use lore_cloudflare::R2Settings;
 use lore_cloudflare::TursoClient;
 use lore_cloudflare::TursoError;
 use lore_cloudflare::TursoErrorKind;
@@ -40,6 +60,7 @@ use lore_cloudflare::TursoExecutor;
 use lore_cloudflare::TursoLimits;
 use lore_cloudflare::TursoSettings;
 use lore_cloudflare::TursoTransaction;
+use lore_cloudflare::connect_r2;
 use lore_cloudflare::turso::TursoRow;
 use lore_cloudflare::turso::TursoValues;
 use tokio::sync::OnceCell;
@@ -106,6 +127,133 @@ pub fn mutable_store(executor: Arc<dyn TursoExecutor>) -> Arc<CloudflareMutableS
 /// A lock store over `executor`.
 pub fn lock_store(executor: Arc<dyn TursoExecutor>) -> CloudflareLockStore {
     CloudflareLockStore::new(executor, limits())
+}
+
+/// An immutable store over `r2` and `executor`.
+pub fn immutable_store(
+    r2: Arc<dyn R2Client>,
+    executor: Arc<dyn TursoExecutor>,
+    force_write: bool,
+) -> Arc<CloudflareImmutableStore> {
+    Arc::new(CloudflareImmutableStore::new(
+        r2,
+        executor,
+        limits(),
+        &CloudflareImmutableStoreSettings::new(force_write),
+    ))
+}
+
+// =============================================================================
+// The endpoint under test
+// =============================================================================
+
+/// The settings the immutable store is built from, if the environment names an endpoint.
+///
+/// The values are the plugin's own resolution: the same variable names, and the same defaults for
+/// what a local endpoint leaves out. A missing endpoint, bucket or key reports that this run has no
+/// endpoint rather than guessing at one — the SDK's own default is S3 itself, which is the one
+/// place a test must never write.
+pub fn r2_settings() -> Option<R2Settings> {
+    let url = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+
+    let Some(endpoint) = url("LORE_R2_ENDPOINT_URL") else {
+        return None;
+    };
+
+    let Some(bucket) = url("LORE_R2_BUCKET") else {
+        return None;
+    };
+
+    let Some(access_key_id) = url("LORE_R2_ACCESS_KEY_ID") else {
+        return None;
+    };
+
+    let Some(secret_access_key) = url("LORE_R2_SECRET_ACCESS_KEY") else {
+        return None;
+    };
+
+    // `MinIO` and R2 both answer to a bucket in the path, and neither cares what the signature
+    // calls the region.
+    Some(
+        R2Settings::new(bucket, R2Credentials::new(access_key_id, secret_access_key))
+            .with_endpoint_url(Some(endpoint))
+            .with_region(Some("auto".to_string()))
+            .with_force_path_style(true),
+    )
+}
+
+/// A client over the bucket the environment names, or a report that this run has none.
+pub async fn r2(label: &str) -> Option<Arc<dyn R2Client>> {
+    let Some(settings) = r2_settings() else {
+        eprintln!(
+            "{label}: did not run — set LORE_R2_ENDPOINT_URL, LORE_R2_BUCKET, \
+             LORE_R2_ACCESS_KEY_ID and LORE_R2_SECRET_ACCESS_KEY to an S3 endpoint (see \
+             tests/support/mod.rs)"
+        );
+        return None;
+    };
+
+    // The store only checks that the bucket it was pointed at is there, because on R2 a bucket is
+    // made in the Cloudflare dashboard and a server that made its own would be as likely to be
+    // pointed at a typo as at a new bucket. A local `MinIO` starts with no buckets at all, so the
+    // test makes the one it was pointed at, the way a deployment would.
+    ensure_bucket(&settings)
+        .await
+        .unwrap_or_else(|error| panic!("{label}: could not prepare the bucket: {error}"));
+
+    Some(
+        connect_r2(&settings)
+            .await
+            .unwrap_or_else(|error| panic!("{label}: could not reach {settings:?}: {error}")),
+    )
+}
+
+/// Make sure the endpoint has the bucket, the way an operator would before a deployment.
+async fn ensure_bucket(settings: &R2Settings) -> Result<(), Box<dyn std::error::Error>> {
+    use lore_aws::clients::AwsClientBuilder;
+
+    let http_settings = lore_aws::clients::HttpClientSettings::default();
+    let credentials = aws_sdk_s3::config::Credentials::new(
+        settings.credentials().access_key_id(),
+        settings.credentials().secret_access_key(),
+        None,
+        None,
+        "lore-cloudflare-tests",
+    );
+
+    let client = AwsClientBuilder::builder()
+        .with_http_settings(&http_settings)
+        .with_credentials_provider(credentials)
+        .maybe_endpoint(settings.endpoint_url().map(|url| url.to_string()))
+        .maybe_region(settings.region().map(|region| region.to_string()))
+        .build_config()
+        .await
+        .s3_with_path_style(settings.force_path_style())
+        .build()
+        .await?;
+
+    if client.bucket_exists(settings.bucket().to_string()).await? {
+        return Ok(());
+    }
+
+    tracing::info!(bucket = settings.bucket(), "Creating the test bucket");
+
+    match client
+        .sdk_client()
+        .create_bucket()
+        .bucket(settings.bucket())
+        .send()
+        .await
+    {
+        Ok(_) => Ok(()),
+        // Two tests can reach this at once in a fresh endpoint.
+        Err(error) if error.as_service_error().is_some() => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 // =============================================================================

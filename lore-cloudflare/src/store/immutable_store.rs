@@ -294,7 +294,11 @@ impl CloudflareImmutableStore {
     }
 
     /// The key a hash is stored under, in both the bucket and the tables.
-    fn object_key(hash: Hash) -> String {
+    ///
+    /// Content-addressed and unprefixed, so an object is found by the hash alone and two
+    /// partitions holding the same content hold the same object. The key names no partition, which
+    /// is why the association is the only thing that says who may read it.
+    pub fn object_key(hash: Hash) -> String {
         let mut dst = [0u8; 64];
         lore_revision::util::to_hex_str(hash.data(), &mut dst).to_owned()
     }
