@@ -419,6 +419,25 @@ fn resolve_r2(configuration: &str) -> Result<R2Settings, lore_server::plugins::P
     config.resolve_r2_with(PLUGIN_NAME, &no_environment)
 }
 
+/// The region is read for the signature's sake alone, so leaving the key out means `auto` rather
+/// than a client that cannot sign a request at all.
+#[test]
+fn test_an_absent_r2_region_is_auto() {
+    let complete = r#"
+        s3_bucket = "bucket"
+        s3_endpoint_url = "https://account.r2.cloudflarestorage.com"
+        r2_access_key_id = "id"
+        r2_secret_access_key = "secret"
+        "#;
+
+    let r2 = resolve_r2(complete).expect("a region is not required");
+    assert_eq!(r2.region(), Some("auto"));
+
+    let r2 = resolve_r2(&format!("{complete}\ns3_region = \"us-east-1\""))
+        .expect("the R2 settings resolve");
+    assert_eq!(r2.region(), Some("us-east-1"), "a region given wins");
+}
+
 /// A whole `[plugins]` section, the way the server reads it out of the settings file.
 #[derive(serde::Deserialize)]
 struct Plugins {
@@ -551,7 +570,9 @@ fn test_an_r2_configuration_without_the_optional_keys_holds_the_defaults() {
         settings.force_path_style(),
         "a bucket in the path is what both R2 and MinIO answer"
     );
-    assert_eq!(settings.region(), None);
+    // R2 answers `auto` for every region, so it is the default a configuration that leaves the
+    // key out is given: the region is not something a caller of the plugin has to know.
+    assert_eq!(settings.region(), Some("auto"));
     assert_eq!(
         settings.slow_operation_threshold_millis(),
         lore_cloudflare::store::r2::DEFAULT_SLOW_OPERATION_THRESHOLD_MILLIS
