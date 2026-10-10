@@ -131,11 +131,8 @@ impl CloudflareMutableStore {
 
         // The macro may run the operation again, and a value that was moved into the first
         // attempt is not there for the second, so the parameters are handed over afresh.
-        retry_within_deadline!(
-            self.limits,
-            self.executor.execute(sql, parameters.clone())
-        )
-        .map_err(|error| error.into_store_error("storing a mutable value"))?;
+        retry_within_deadline!(self.limits, self.executor.execute(sql, parameters.clone()))
+            .map_err(|error| error.into_store_error("storing a mutable value"))?;
 
         Ok(())
     }
@@ -268,11 +265,9 @@ impl CloudflareMutableStore {
         let mut cursor = None;
 
         loop {
-            let rows = retry_within_deadline!(
-                self.limits,
-                self.list_page(partition, key_type, cursor)
-            )
-            .map_err(|error| error.into_store_error("listing a mutable store's keys"))?;
+            let rows =
+                retry_within_deadline!(self.limits, self.list_page(partition, key_type, cursor))
+                    .map_err(|error| error.into_store_error("listing a mutable store's keys"))?;
 
             let more = rows.len() == LIST_PAGE_SIZE;
 

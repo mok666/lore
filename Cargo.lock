@@ -2781,19 +2781,12 @@ name = "lore-cloudflare"
 version = "0.10.1-nightly"
 dependencies = [
  "async-trait",
- "bytes",
- "chrono",
- "futures",
  "libsql",
  "lore-base",
- "lore-error-set",
- "lore-macro",
  "lore-revision",
  "lore-storage",
  "rand 0.9.4",
- "serde",
  "tokio",
- "toml 0.9.12+spec-1.1.0",
  "tracing",
 ]
 

@@ -22,7 +22,7 @@ use lore_base::error::SlowDown;
 use lore_revision::lock::LockError;
 use lore_storage::StoreError;
 
-/// SQLite primary result codes this crate tells apart. The extended codes share the low byte, so
+/// `SQLite` primary result codes this crate tells apart. The extended codes share the low byte, so
 /// `SQLITE_BUSY_RECOVERY` and friends arrive here as [`SQLITE_BUSY`].
 const SQLITE_BUSY: i32 = 5;
 const SQLITE_LOCKED: i32 = 6;
@@ -40,7 +40,7 @@ pub enum TursoErrorKind {
     SlowDown,
     /// Turso refused the request because the account is over its quota. Retrying cannot fix it.
     Maintenance,
-    /// A bug in this crate or in its configuration: a statement SQLite rejected, a column of the
+    /// A bug in this crate or in its configuration: a statement `SQLite` rejected, a column of the
     /// wrong type, a schema version this build does not understand.
     Internal,
 }
@@ -79,17 +79,15 @@ impl TursoError {
         &self.message
     }
 
-    /// Sort a libSQL failure. The variants that name a SQLite result code are read directly;
+    /// Sort a libSQL failure. The variants that name a `SQLite` result code are read directly;
     /// everything else goes through [`Self::classify`].
     pub fn from_libsql(error: libsql::Error) -> Self {
         match &error {
             libsql::Error::ConnectionFailed(_) => {
                 Self::new(TursoErrorKind::Disconnected, error.to_string())
             }
-            libsql::Error::SqliteFailure(code, _) => {
-                Self::new(sqlite_primary_kind(*code), error.to_string())
-            }
-            libsql::Error::RemoteSqliteFailure(code, _, _) => {
+            libsql::Error::SqliteFailure(code, _)
+            | libsql::Error::RemoteSqliteFailure(code, _, _) => {
                 Self::new(sqlite_primary_kind(*code), error.to_string())
             }
             other => {
@@ -104,12 +102,12 @@ impl TursoError {
     /// The markers are the `Display`/`Debug` forms of the private `HranaError` and of the
     /// statement errors it carries:
     ///
-    /// - `http error: \`...\``, `Failed to connect to database: \`...\``, `stream closed:
-    ///   \`...\``, `unexpected response: \`...\`` and `json error: \`...\`` all mean the exchange
-    ///   with Turso ended early.
-    /// - `stream error: \`Error { message: ..., code: "SQLITE_BUSY" | "SQLITE_LOCKED" }\`` is a
-    ///   statement the server refused for a lock reason.
-    /// - `api error: \`status=..., body=...\`` carrying `BLOCKED` is a quota refusal.
+    /// - An exchange that ended early says so: `http error`, `Failed to connect to database`,
+    ///   `stream closed`, `unexpected response` and `json error` all name what went wrong in
+    ///   front of the text the server sent back.
+    /// - A statement the server refused for a lock reason arrives as the `Debug` form of the
+    ///   statement error it carries: a message, and a code of `SQLITE_BUSY` or `SQLITE_LOCKED`.
+    /// - A quota refusal arrives as an api error carrying `BLOCKED`.
     ///
     /// Anything unrecognised is [`TursoErrorKind::Internal`]: an error this crate does not
     /// understand is not one it should quietly retry.
@@ -142,7 +140,10 @@ impl TursoError {
                 StoreError::from(Disconnected)
             }
             TursoErrorKind::SlowDown => {
-                tracing::warn!(message = self.message, "{context}: Turso refused the write lock");
+                tracing::warn!(
+                    message = self.message,
+                    "{context}: Turso refused the write lock"
+                );
                 StoreError::from(SlowDown)
             }
             TursoErrorKind::Maintenance => {
@@ -153,7 +154,10 @@ impl TursoError {
                 StoreError::from(Maintenance)
             }
             TursoErrorKind::Internal => {
-                tracing::error!(message = self.message, "{context}: unexpected Turso failure");
+                tracing::error!(
+                    message = self.message,
+                    "{context}: unexpected Turso failure"
+                );
                 StoreError::internal_with_context(self, context)
             }
         }
@@ -179,7 +183,10 @@ impl TursoError {
                 LockError::internal_with_context(self, context)
             }
             TursoErrorKind::Internal => {
-                tracing::error!(message = self.message, "{context}: unexpected Turso failure");
+                tracing::error!(
+                    message = self.message,
+                    "{context}: unexpected Turso failure"
+                );
                 LockError::internal_with_context(self, context)
             }
         }
@@ -200,8 +207,8 @@ impl From<libsql::Error> for TursoError {
     }
 }
 
-/// The kind a SQLite primary result code means for a store operation.
-/// Which kind a SQLite result code belongs to.
+/// The kind a `SQLite` primary result code means for a store operation.
+/// Which kind a `SQLite` result code belongs to.
 ///
 /// A server reports an extended code as readily as a primary one, and an extended code carries
 /// the primary code in its low byte: `SQLITE_BUSY_SNAPSHOT` (261) is a kind of `SQLITE_BUSY` (5).
@@ -308,11 +315,11 @@ mod test {
 
     #[test]
     fn a_remote_sqlite_failure_is_read_from_its_code() {
-        let error = libsql::Error::RemoteSqliteFailure(
-            SQLITE_BUSY,
-            517,
-            "database is locked".to_string(),
+        let error =
+            libsql::Error::RemoteSqliteFailure(SQLITE_BUSY, 517, "database is locked".to_string());
+        assert_eq!(
+            TursoError::from_libsql(error).kind(),
+            TursoErrorKind::SlowDown
         );
-        assert_eq!(TursoError::from_libsql(error).kind(), TursoErrorKind::SlowDown);
     }
 }

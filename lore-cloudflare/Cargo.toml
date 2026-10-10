@@ -6,25 +6,25 @@ publish = false
 
 [dependencies]
 async-trait = { workspace = true }
-bytes = { workspace = true }
-chrono = { workspace = true }
 libsql = { version = "0.9.30", default-features = false, features = [
     "remote",
     "tls",
 ] }
 lore-base = { workspace = true }
-lore-error-set = { workspace = true }
-lore-macro = { workspace = true }
 lore-revision = { workspace = true }
 lore-storage = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true }
-toml = { workspace = true }
 tracing = { workspace = true }
 
+# The immutable store (R2), and the `bytes` / `chrono` / `serde` / `toml` that read its
+# configuration, are not implemented yet. Their dependencies arrive with the code that uses them,
+# so that nothing here is declared and unused.
 [dev-dependencies]
-futures = { workspace = true }
 rand = { workspace = true }
 
 [features]
 default = []
+# The integration tests reach a real libSQL server, so CI has to be asked for them. Without the
+# feature they are not built at all; with it they still skip a test whose server is not configured
+# (see `tests/support/mod.rs`).
+integration_tests = []

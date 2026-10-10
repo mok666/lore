@@ -15,15 +15,14 @@ pub mod error;
 pub mod retry;
 pub mod schema;
 
-pub use error::TursoError;
-pub use error::TursoErrorKind;
-pub use retry::TursoRetry;
-
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+pub use error::TursoError;
+pub use error::TursoErrorKind;
+pub use retry::TursoRetry;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 
@@ -172,9 +171,10 @@ impl TursoSettings {
             return Err("url is empty".to_string());
         }
 
-        if self.token.trim().is_empty() {
-            return Err("auth token is empty".to_string());
-        }
+        // An empty token is not rejected here: a local libSQL server needs none, and a server
+        // that does need one refuses the first statement with its own message. A deployment
+        // against Turso cloud still stops at startup, because the plugin requires the key before
+        // it gets this far.
 
         if self.limits.timeout.is_zero() {
             return Err("timeout_millis is 0, so no operation could finish".to_string());
@@ -219,7 +219,10 @@ impl fmt::Debug for TursoSettings {
             .field("token", &"<redacted>")
             .field("limits", &self.limits)
             .field("max_connections", &self.max_connections)
-            .field("max_transaction_statements", &self.max_transaction_statements)
+            .field(
+                "max_transaction_statements",
+                &self.max_transaction_statements,
+            )
             .finish()
     }
 }
@@ -246,13 +249,11 @@ impl TursoClient {
             .validate()
             .map_err(|message| TursoError::new(TursoErrorKind::Internal, message))?;
 
-        let database = libsql::Builder::new_remote(
-            settings.url().to_string(),
-            settings.token().to_string(),
-        )
-        .build()
-        .await
-        .map_err(TursoError::from_libsql)?;
+        let database =
+            libsql::Builder::new_remote(settings.url().to_string(), settings.token().to_string())
+                .build()
+                .await
+                .map_err(TursoError::from_libsql)?;
 
         tracing::debug!(settings = ?settings, "Connected to Turso");
 
@@ -314,12 +315,16 @@ impl TursoClient {
 
     /// Wait for room to run one more statement.
     async fn permit(&self) -> Result<OwnedSemaphorePermit, TursoError> {
-        self.limiter.clone().acquire_owned().await.map_err(|_| {
-            TursoError::new(
-                TursoErrorKind::Internal,
-                "the connection limiter was closed",
-            )
-        })
+        self.limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_closed| {
+                TursoError::new(
+                    TursoErrorKind::Internal,
+                    "the connection limiter was closed",
+                )
+            })
     }
 }
 
@@ -384,7 +389,10 @@ async fn collect_rows(mut rows: libsql::Rows) -> Result<Vec<TursoRow>, TursoErro
         let mut values = Vec::with_capacity(columns);
 
         for index in 0..columns {
-            values.push(row.get_value(index as i32).map_err(TursoError::from_libsql)?);
+            values.push(
+                row.get_value(index as i32)
+                    .map_err(TursoError::from_libsql)?,
+            );
         }
 
         collected.push(values);
@@ -410,11 +418,8 @@ impl LibsqlTransaction {
         })
     }
 
-    fn take(slot: Box<Self>) -> Result<libsql::Transaction, TursoError> {
-        // The transaction is moved out of the box, so the slot's permit is released with it.
-        let mut slot = *slot;
-
-        slot.transaction.take().ok_or_else(|| {
+    fn take(&mut self) -> Result<libsql::Transaction, TursoError> {
+        self.transaction.take().ok_or_else(|| {
             TursoError::new(
                 TursoErrorKind::Internal,
                 "the transaction has already finished",
@@ -443,14 +448,16 @@ impl TursoTransaction for LibsqlTransaction {
     }
 
     async fn commit(self: Box<Self>) -> Result<(), TursoError> {
-        Self::take(self)?
-            .commit()
-            .await
-            .map_err(TursoError::from_libsql)
+        // The transaction is taken out of the slot once, and the slot's permit is released with it.
+        let mut slot = *self;
+
+        slot.take()?.commit().await.map_err(TursoError::from_libsql)
     }
 
     async fn rollback(self: Box<Self>) -> Result<(), TursoError> {
-        Self::take(self)?
+        let mut slot = *self;
+
+        slot.take()?
             .rollback()
             .await
             .map_err(TursoError::from_libsql)
@@ -500,13 +507,7 @@ mod test {
         let settings = TursoSettings::new("libsql://example.turso.io", "token");
         assert!(settings.validate().is_ok());
 
-        assert!(
-            settings
-                .clone()
-                .with_max_connections(0)
-                .validate()
-                .is_err()
-        );
+        assert!(settings.clone().with_max_connections(0).validate().is_err());
         assert!(
             settings
                 .clone()
@@ -522,11 +523,13 @@ mod test {
                 .is_err()
         );
         assert!(TursoSettings::new("", "token").validate().is_err());
-        assert!(TursoSettings::new("libsql://example.turso.io", "").validate().is_err());
+
+        // A token is not this type's business: a local server needs none, and the plugin is what
+        // requires the key for a deployment that does.
         assert!(
-            TursoSettings::new("libsql://example.turso.io", "   ")
+            TursoSettings::new("libsql://example.turso.io", "")
                 .validate()
-                .is_err()
+                .is_ok()
         );
     }
 }
