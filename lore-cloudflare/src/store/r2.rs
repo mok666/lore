@@ -32,9 +32,9 @@ use lore_aws::clients::AwsClientBuilder;
 use lore_aws::clients::HttpClientSettings;
 use lore_aws::clients::TimeoutConfig;
 use lore_aws::s3::S3Impl;
-use lore_storage::errors::NotFound;
 use lore_storage::SlowDown;
 use lore_storage::StoreError;
+use lore_storage::errors::NotFound;
 
 /// The slow-operation threshold a deployment gets when it configures none. Every request that
 /// takes longer than this is logged with its elapsed time, which is how a store that is merely
@@ -204,7 +204,11 @@ impl R2Settings {
             return Err("endpoint_url is empty".to_string());
         }
 
-        if self.region.as_deref().is_some_and(|region| region.trim().is_empty()) {
+        if self
+            .region
+            .as_deref()
+            .is_some_and(|region| region.trim().is_empty())
+        {
             return Err("region is empty".to_string());
         }
 
@@ -279,9 +283,7 @@ impl R2Error {
             Self::NotFound => StoreError::from(NotFound),
             Self::SlowDown => StoreError::from(SlowDown),
             // The context reads as the action: "... while reading a payload from R2".
-            Self::Failed(message) => {
-                StoreError::internal(format!("{message} while {context}"))
-            }
+            Self::Failed(message) => StoreError::internal(format!("{message} while {context}")),
         }
     }
 
@@ -418,8 +420,9 @@ impl R2Client for S3R2Client {
             .await
             .map(|_output| ())
             .map_err(|error| {
-                classify(&error)
-                    .map_failed(|message| format!("{message} while writing {length} bytes to {key}"))
+                classify(&error).map_failed(|message| {
+                    format!("{message} while writing {length} bytes to {key}")
+                })
             })
     }
 
@@ -487,9 +490,7 @@ where
             match status {
                 404 => R2Error::NotFound,
                 429 | 500..=599 => R2Error::SlowDown,
-                _ => R2Error::Failed(format!(
-                    "R2 answered HTTP {status} ({code})"
-                )),
+                _ => R2Error::Failed(format!("R2 answered HTTP {status} ({code})")),
             }
         }
         _ => R2Error::Failed(format!("{sdk_error:?}")),
@@ -546,9 +547,12 @@ mod test {
     /// key in a log is a key in a log.
     #[test]
     fn printing_the_settings_never_prints_a_key() {
-        let printed = format!("{:?}", settings().with_endpoint_url(Some(
-            "https://account.r2.cloudflarestorage.com?token=also-a-secret".to_string()
-        )));
+        let printed = format!(
+            "{:?}",
+            settings().with_endpoint_url(Some(
+                "https://account.r2.cloudflarestorage.com?token=also-a-secret".to_string()
+            ))
+        );
 
         assert!(!printed.contains("secret"), "{printed}");
         assert!(!printed.contains("account.r2"), "{printed}");

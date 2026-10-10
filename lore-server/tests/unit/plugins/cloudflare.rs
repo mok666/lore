@@ -434,16 +434,11 @@ fn test_the_r2_settings_come_from_the_configuration_and_the_environment() {
     .unwrap();
 
     let settings = config
-        .resolve_r2_with(
-            PLUGIN_NAME,
-            &|name| match name {
-                "LORE_R2_ENDPOINT_URL" => {
-                    Some("https://account.r2.cloudflarestorage.com".to_string())
-                }
-                "LORE_R2_SECRET_ACCESS_KEY" => Some("from-the-environment".to_string()),
-                _ => None,
-            },
-        )
+        .resolve_r2_with(PLUGIN_NAME, &|name| match name {
+            "LORE_R2_ENDPOINT_URL" => Some("https://account.r2.cloudflarestorage.com".to_string()),
+            "LORE_R2_SECRET_ACCESS_KEY" => Some("from-the-environment".to_string()),
+            _ => None,
+        })
         .expect("the endpoint and the secret come from the environment");
 
     assert_eq!(settings.bucket(), "bucket");

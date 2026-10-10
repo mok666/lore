@@ -281,16 +281,14 @@ impl CloudflarePluginConfig {
             environment,
         )?;
 
-        let settings = R2Settings::new(
-            bucket,
-            R2Credentials::new(access_key_id, secret_access_key),
-        )
-        .with_endpoint_url(Some(endpoint))
-        .with_region(self.s3_region.clone())
-        .with_force_path_style(self.s3_force_path_style)
-        .with_slow_operation_threshold_millis(self.r2_slow_operation_threshold_millis)
-        .with_timeout_millis(self.timeout_millis)
-        .with_http_settings(self.http.clone());
+        let settings =
+            R2Settings::new(bucket, R2Credentials::new(access_key_id, secret_access_key))
+                .with_endpoint_url(Some(endpoint))
+                .with_region(self.s3_region.clone())
+                .with_force_path_style(self.s3_force_path_style)
+                .with_slow_operation_threshold_millis(self.r2_slow_operation_threshold_millis)
+                .with_timeout_millis(self.timeout_millis)
+                .with_http_settings(self.http.clone());
 
         settings.validate().map_err(|message| {
             PluginError::from(PluginConfigError {
@@ -307,7 +305,8 @@ impl CloudflarePluginConfig {
 ///
 /// The message names both places it could have been and never the value it holds: a value in the
 /// log of a server that failed to start is a secret in a log.
-fn required(    plugin_name: &str,
+fn required(
+    plugin_name: &str,
     key: &str,
     variable: &str,
     configured: Option<&str>,
