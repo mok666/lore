@@ -201,8 +201,12 @@ impl From<libsql::Error> for TursoError {
 }
 
 /// The kind a SQLite primary result code means for a store operation.
+/// Which kind a SQLite result code belongs to.
+///
+/// A server reports an extended code as readily as a primary one, and an extended code carries
+/// the primary code in its low byte: `SQLITE_BUSY_SNAPSHOT` (261) is a kind of `SQLITE_BUSY` (5).
 fn sqlite_primary_kind(code: i32) -> TursoErrorKind {
-    match code {
+    match code & 0xff {
         SQLITE_BUSY | SQLITE_LOCKED => TursoErrorKind::SlowDown,
         SQLITE_IOERR => TursoErrorKind::Disconnected,
         _ => TursoErrorKind::Internal,

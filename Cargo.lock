@@ -3036,6 +3036,7 @@ dependencies = [
  "jsonwebtoken",
  "lore-aws",
  "lore-base",
+ "lore-cloudflare",
  "lore-error-set",
  "lore-hashicorp",
  "lore-macro",

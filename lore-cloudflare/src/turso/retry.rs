@@ -161,7 +161,7 @@ mod test {
     #[tokio::test]
     async fn a_success_is_returned_as_it_is() {
         let result: Result<u8, TursoError> =
-            retry_within_deadline!(limits(TursoRetry::new(0, 0, 3)), async { Ok(7) });
+            retry_within_deadline!(limits(TursoRetry::new(0, 0, 3)), async { Ok::<u8, TursoError>(7) });
         assert_eq!(result.unwrap(), 7);
     }
 
