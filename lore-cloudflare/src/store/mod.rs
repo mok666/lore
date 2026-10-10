@@ -316,8 +316,10 @@ mod test {
             context
         );
 
+        // A blob of the wrong width is refused rather than being padded or truncated into a
+        // context nobody asked for.
         let error =
-            context_from_repository_context("repository_context", &hash_blob(&Hash::default()))
+            context_from_repository_context("repository_context", &partition_blob(partition))
                 .unwrap_err();
         assert!(format!("{error}").contains("repository and context"));
     }

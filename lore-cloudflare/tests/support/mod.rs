@@ -160,21 +160,10 @@ pub fn r2_settings() -> Option<R2Settings> {
             .filter(|value| !value.trim().is_empty())
     };
 
-    let Some(endpoint) = url("LORE_R2_ENDPOINT_URL") else {
-        return None;
-    };
-
-    let Some(bucket) = url("LORE_R2_BUCKET") else {
-        return None;
-    };
-
-    let Some(access_key_id) = url("LORE_R2_ACCESS_KEY_ID") else {
-        return None;
-    };
-
-    let Some(secret_access_key) = url("LORE_R2_SECRET_ACCESS_KEY") else {
-        return None;
-    };
+    let endpoint = url("LORE_R2_ENDPOINT_URL")?;
+    let bucket = url("LORE_R2_BUCKET")?;
+    let access_key_id = url("LORE_R2_ACCESS_KEY_ID")?;
+    let secret_access_key = url("LORE_R2_SECRET_ACCESS_KEY")?;
 
     // `MinIO` and R2 both answer to a bucket in the path, and neither cares what the signature
     // calls the region.

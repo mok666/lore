@@ -545,19 +545,33 @@ mod test {
 
     /// The point of the redaction: the plugin logs the settings while the server starts, and a
     /// key in a log is a key in a log.
+    ///
+    /// The assertion is on the values rather than on the field names, because the names are what
+    /// makes the line readable and one of them has to say `secret_access_key`.
     #[test]
     fn printing_the_settings_never_prints_a_key() {
         let printed = format!(
             "{:?}",
-            settings().with_endpoint_url(Some(
+            R2Settings::new(
+                "bucket",
+                R2Credentials::new("the-access-key-id", "the-secret-access-key")
+            )
+            .with_endpoint_url(Some(
                 "https://account.r2.cloudflarestorage.com?token=also-a-secret".to_string()
             ))
         );
 
-        assert!(!printed.contains("secret"), "{printed}");
-        assert!(!printed.contains("account.r2"), "{printed}");
+        assert!(!printed.contains("the-access-key-id"), "{printed}");
+        assert!(!printed.contains("the-secret-access-key"), "{printed}");
         assert!(printed.contains("bucket"), "{printed}");
         assert!(printed.contains("<redacted>"), "{printed}");
+
+        // The endpoint keeps its host, which is not a secret and which an operator has to be able
+        // to see: an endpoint that is left out entirely points the client at S3, and the log line
+        // is the only place that says which of the two the server is talking to. What goes is the
+        // query string, where a signed url sometimes carries a token.
+        assert!(printed.contains("account.r2"), "{printed}");
+        assert!(!printed.contains("also-a-secret"), "{printed}");
     }
 
     #[test]
