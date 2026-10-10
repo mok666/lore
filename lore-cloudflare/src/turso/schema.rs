@@ -5,7 +5,10 @@
 /// Which version of the schema this build writes and understands.
 ///
 /// A database holding another version stops the server at startup rather than running against a
-/// table layout it never agreed on. There is no migration: the database starts empty.
+/// table layout it never agreed on. There is no migration: the database starts empty, and a table
+/// that is already there is left exactly as it is, because `CREATE TABLE IF NOT EXISTS` adds no
+/// column to it. Version 1 has not been deployed, so its tables are still free to change shape
+/// here; a database that already holds one of the older shapes has to be emptied by hand.
 pub const SCHEMA_VERSION: i64 = 1;
 
 /// The statement that asks which version is installed.
@@ -25,10 +28,13 @@ pub const INSERT_SCHEMA_VERSION: &str =
 /// arrive with the code that reads them.
 pub const DDL_STATEMENTS: &[&str] = &[
     // One row per hash the store knows, holding the fragment's state bits as they are written:
-    // stored is 0, and obliteration adds its own bits to that value.
+    // stored is 0, and obliteration adds its own bits to that value. `nonce` is the mark of the
+    // write that last moved the state, which is how the writer that lost the answer to its own move
+    // tells that move from another writer's (spec §4.6).
     "CREATE TABLE IF NOT EXISTS fragment_state (
         hash  BLOB NOT NULL PRIMARY KEY,
-        state INTEGER NOT NULL
+        state INTEGER NOT NULL,
+        nonce BLOB NOT NULL
     ) WITHOUT ROWID",
     // Which repositories a fragment is stored for. `repository_context` is the repository's id
     // followed by the address context, 32 bytes together, so one fragment can be stored for
