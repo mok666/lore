@@ -419,6 +419,79 @@ fn resolve_r2(configuration: &str) -> Result<R2Settings, lore_server::plugins::P
     config.resolve_r2_with(PLUGIN_NAME, &no_environment)
 }
 
+/// A whole `[plugins]` section, the way the server reads it out of the settings file.
+#[derive(serde::Deserialize)]
+struct Plugins {
+    plugins: std::collections::HashMap<String, toml::Value>,
+}
+
+/// A per-store section is merged over the parent, so a deployment that needs a store pointed
+/// somewhere else writes only the key that differs (spec §2.2).
+///
+/// The merge belongs to the server and not to the plugin — this is the server's function — but the
+/// section it hands the factory is what the plugin's `deny_unknown_fields` sees, so the two have to
+/// be checked together: a merge that left the store sections in the parent would be refused here.
+#[test]
+fn test_a_store_section_overrides_the_parent_and_keeps_the_rest() {
+    let settings: Plugins = toml::from_str(
+        r#"
+        [plugins.cloudflare]
+        s3_bucket = "the-parent-bucket"
+        s3_endpoint_url = "https://account.r2.cloudflarestorage.com"
+        r2_access_key_id = "the-access-key-id"
+        r2_secret_access_key = "the-secret-access-key"
+        turso_url = "http://parent.example:8080"
+        turso_auth_token = "the-token"
+
+        [plugins.cloudflare.immutable_store]
+        s3_bucket = "the-immutable-bucket"
+        "#,
+    )
+    .expect("a [plugins] section should deserialize");
+
+    let resolved = lore_server::store::resolve_plugin_config_with_fallback(
+        &settings.plugins,
+        PLUGIN_NAME,
+        "immutable_store",
+    )
+    .expect("the plugin is configured");
+
+    CloudflareImmutableStorePluginFactory
+        .validate_config(&resolved)
+        .expect("the merged section is one the immutable store reads");
+
+    let config: CloudflarePluginConfig = resolved
+        .try_into()
+        .expect("the merged section deserializes");
+    let r2 = config
+        .resolve_r2_with(PLUGIN_NAME, &no_environment)
+        .expect("the merged section is complete");
+
+    assert_eq!(
+        r2.bucket(),
+        "the-immutable-bucket",
+        "the section's bucket wins over the parent's"
+    );
+    assert_eq!(
+        r2.endpoint_url(),
+        Some("https://account.r2.cloudflarestorage.com"),
+        "the parent's keys survive the merge, so a section names only what differs"
+    );
+    assert_eq!(r2.credentials().access_key_id(), "the-access-key-id");
+
+    // The other stores still resolve from the parent alone, without the section.
+    let resolved = lore_server::store::resolve_plugin_config_with_fallback(
+        &settings.plugins,
+        PLUGIN_NAME,
+        "mutable_store",
+    )
+    .expect("the plugin is configured");
+
+    CloudflareMutableStorePluginFactory
+        .validate_config(&resolved)
+        .expect("the immutable store's section does not reach the mutable store");
+}
+
 /// What the configuration holds is what the client is built from, and what it leaves out comes
 /// from the environment.
 #[test]
