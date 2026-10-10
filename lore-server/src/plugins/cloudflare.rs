@@ -122,6 +122,27 @@ pub struct CloudflarePluginConfig {
     #[serde(default)]
     pub force_write: bool,
 
+    /// The section for another store of this plugin.
+    ///
+    /// The server merges the section belonging to the store it is building over the parent before
+    /// the plugin sees it, and drops the other two sections on the way. It only does that when the
+    /// section for *this* store exists: given a configuration that writes
+    /// `[plugins.cloudflare.immutable_store]` and runs the mutable store from the parent alone,
+    /// the parent it hands over still carries the immutable section. These three fields are what
+    /// keeps such a configuration readable, and they are read by nobody — a section for another
+    /// store is that store's business, and the store it names is handed it merged rather than as a
+    /// field.
+    #[serde(default)]
+    pub immutable_store: Option<toml::Value>,
+
+    /// See [`CloudflarePluginConfig::immutable_store`].
+    #[serde(default)]
+    pub mutable_store: Option<toml::Value>,
+
+    /// See [`CloudflarePluginConfig::immutable_store`].
+    #[serde(default)]
+    pub lock_store: Option<toml::Value>,
+
     /// The longest one store operation may take.
     ///
     /// One value for both services, because a store operation that spans them is bounded by the
