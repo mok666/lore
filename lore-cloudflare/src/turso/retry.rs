@@ -64,7 +64,7 @@ macro_rules! retry_within_deadline {
                 match $operation.await {
                     Err(error) if error.is_disconnected() && waiter.wait().await => {
                         tracing::warn!(
-                            message = error.message(),
+                            reason = %error.message(),
                             attempt = waiter.counter(),
                             limit = limits.retry.limit,
                             "lost the answer from Turso; retrying"
