@@ -29,9 +29,10 @@ pub use store::CloudflareLockStore;
 pub use store::CloudflareMutableStore;
 pub use turso::TursoClient;
 pub use turso::TursoError;
+pub use turso::TursoErrorKind;
 pub use turso::TursoExecutor;
-
 pub use turso::TursoLimits;
+pub use turso::TursoRetry;
 pub use turso::TursoSettings;
 pub use turso::TursoTransaction;
 

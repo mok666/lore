@@ -98,7 +98,8 @@ pub async fn with_deadline<T>(
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use super::*;
     use crate::turso::TursoErrorKind;
@@ -131,10 +132,11 @@ mod test {
             let attempts = Arc::new(AtomicUsize::new(0));
             let attempts_ref = attempts.clone();
 
-            let result: Result<(), TursoError> = retry_within_deadline!(limits(TursoRetry::new(0, 0, limit)), async {
-                attempts_ref.fetch_add(1, Ordering::SeqCst);
-                Err(TursoError::disconnected("lost"))
-            });
+            let result: Result<(), TursoError> =
+                retry_within_deadline!(limits(TursoRetry::new(0, 0, limit)), async {
+                    attempts_ref.fetch_add(1, Ordering::SeqCst);
+                    Err(TursoError::disconnected("lost"))
+                });
 
             assert!(result.is_err());
             assert_eq!(attempts.load(Ordering::SeqCst), limit + 1);
@@ -146,13 +148,11 @@ mod test {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_ref = attempts.clone();
 
-        let result: Result<&str, TursoError> = retry_within_deadline!(
-            limits(TursoRetry::new(0, 0, 3)),
-            async {
+        let result: Result<&str, TursoError> =
+            retry_within_deadline!(limits(TursoRetry::new(0, 0, 3)), async {
                 attempts_ref.fetch_add(1, Ordering::SeqCst);
                 Err::<&str, _>(TursoError::new(TursoErrorKind::SlowDown, "busy"))
-            }
-        );
+            });
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
@@ -161,7 +161,9 @@ mod test {
     #[tokio::test]
     async fn a_success_is_returned_as_it_is() {
         let result: Result<u8, TursoError> =
-            retry_within_deadline!(limits(TursoRetry::new(0, 0, 3)), async { Ok::<u8, TursoError>(7) });
+            retry_within_deadline!(limits(TursoRetry::new(0, 0, 3)), async {
+                Ok::<u8, TursoError>(7)
+            });
         assert_eq!(result.unwrap(), 7);
     }
 
@@ -202,7 +204,8 @@ mod test {
 
     #[tokio::test]
     async fn a_deadline_leaves_a_fast_operation_alone() {
-        let result = with_deadline(Duration::from_secs(30), async { Ok::<u8, TursoError>(7) }).await;
+        let result =
+            with_deadline(Duration::from_secs(30), async { Ok::<u8, TursoError>(7) }).await;
         assert_eq!(result.unwrap(), 7);
     }
 }

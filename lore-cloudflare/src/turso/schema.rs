@@ -92,7 +92,9 @@ mod test {
         ] {
             let creates = DDL_STATEMENTS
                 .iter()
-                .filter(|statement| statement.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")))
+                .filter(|statement| {
+                    statement.contains(&format!("CREATE TABLE IF NOT EXISTS {table}"))
+                })
                 .count();
             assert_eq!(creates, 1, "{table}");
         }

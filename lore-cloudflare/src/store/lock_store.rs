@@ -54,8 +54,7 @@ const LOCK_SQL: &str = "INSERT INTO locks \
      ON CONFLICT (hash, repository_branch) DO NOTHING";
 
 /// Whose lock a row is.
-const OWNER_SQL: &str =
-    "SELECT owner_id FROM locks WHERE hash = ?1 AND repository_branch = ?2";
+const OWNER_SQL: &str = "SELECT owner_id FROM locks WHERE hash = ?1 AND repository_branch = ?2";
 
 /// Release a lock. Whether it is there, and whose it was, is decided before this runs.
 const UNLOCK_SQL: &str = "DELETE FROM locks WHERE hash = ?1 AND repository_branch = ?2";
@@ -85,11 +84,10 @@ impl CloudflareLockStore {
         // One timestamp for the whole request, so the locks it takes look like one moment.
         let locked_at = crate::store::now_millis();
 
-        let transaction = self
-            .executor
-            .begin_immediate()
-            .await
-            .map_err(|error| error.into_lock_error("opening a transaction to lock resources"))?;
+        let transaction =
+            self.executor.begin_immediate().await.map_err(|error| {
+                error.into_lock_error("opening a transaction to lock resources")
+            })?;
 
         let mut locked = Vec::with_capacity(resources.len());
 
@@ -138,32 +136,33 @@ impl CloudflareLockStore {
                         }
                     };
 
-                    match rows.first() {
-                        Some(row) => {
-                            let owner = owner_of(row).map_err(malformed)?;
+                    let Some(row) = rows.first() else {
+                        // The insert conflicted, so a row is there; not finding it means the
+                        // row changed underneath a transaction that holds the write lock.
+                        discard(transaction, "a conflicted row is not there").await;
+                        return Err(LockError::internal(
+                            "a lock insert conflicted, but the row it conflicted with is not \
+                             there",
+                        ));
+                    };
 
-                            if owner == owner_id {
-                                // Held by this owner already: nothing was taken here, so it is not
-                                // part of what this call took.
-                                continue;
-                            }
+                    let owner = owner_of(row).map_err(malformed)?;
 
-                            discard(transaction, "a resource is locked by another owner").await;
-                            return Err(LockNotOwned.into());
-                        }
-                        None => {
-                            // The insert conflicted, so a row is there; not finding it means the
-                            // row changed underneath a transaction that holds the write lock.
-                            discard(transaction, "a conflicted row is not there").await;
-                            return Err(LockError::internal(
-                                "a lock insert conflicted, but the row it conflicted with is not \
-                                 there",
-                            ));
-                        }
+                    if owner == owner_id {
+                        // Held by this owner already: nothing was taken here, so it is not part
+                        // of what this call took.
+                        continue;
                     }
+
+                    discard(transaction, "a resource is locked by another owner").await;
+                    return Err(LockNotOwned.into());
                 }
                 other => {
-                    discard(transaction, "a lock insert reported an impossible row count").await;
+                    discard(
+                        transaction,
+                        "a lock insert reported an impossible row count",
+                    )
+                    .await;
                     return Err(LockError::internal(format!(
                         "taking a lock changed {other} rows, which is neither nothing nor one"
                     )));
@@ -185,11 +184,9 @@ impl CloudflareLockStore {
 
         // The parameters are cloned per attempt: the macro may run the operation again, and a
         // value that was moved into the first attempt is not there for the second.
-        let rows = retry_within_deadline!(
-            self.limits,
-            self.executor.query(&sql, parameters.clone())
-        )
-        .map_err(|error| error.into_lock_error("querying locks"))?;
+        let rows =
+            retry_within_deadline!(self.limits, self.executor.query(&sql, parameters.clone()))
+                .map_err(|error| error.into_lock_error("querying locks"))?;
 
         rows.iter()
             .map(|row| lock_from_row(row, &sql))
@@ -212,11 +209,9 @@ impl CloudflareLockStore {
         for chunk in unique_keys(repository, resources).chunks(CHECK_LOCKS_CHUNK) {
             let (sql, parameters) = check_locks_sql(chunk);
 
-            let rows = retry_within_deadline!(
-                self.limits,
-                self.executor.query(&sql, parameters.clone())
-            )
-            .map_err(|error| error.into_lock_error("checking lock status"))?;
+            let rows =
+                retry_within_deadline!(self.limits, self.executor.query(&sql, parameters.clone()))
+                    .map_err(|error| error.into_lock_error("checking lock status"))?;
 
             for row in &rows {
                 locks.push(lock_from_row(row, &sql).map_err(malformed)?);
@@ -234,7 +229,8 @@ impl CloudflareLockStore {
     ///
     /// Whether a row is missing and whether it belongs to someone else are both decided before
     /// anything is removed, because an affected row count cannot tell the two apart. A row that
-    /// belongs to someone else outranks a row that is not there, as it does in the DynamoDB store.
+    /// belongs to someone else outranks a row that is not there, as it does in the `DynamoDB`
+    /// store.
     async fn unlock_resources_impl(
         &self,
         owner_id: &str,
@@ -244,11 +240,10 @@ impl CloudflareLockStore {
     ) -> Result<Vec<LockResource>, LockError> {
         let keys = unique_resources(resources);
 
-        let transaction = self
-            .executor
-            .begin_immediate()
-            .await
-            .map_err(|error| error.into_lock_error("opening a transaction to unlock resources"))?;
+        let transaction =
+            self.executor.begin_immediate().await.map_err(|error| {
+                error.into_lock_error("opening a transaction to unlock resources")
+            })?;
 
         let mut missing = false;
 
@@ -368,10 +363,7 @@ fn query_locks_sql(query: LockQuery) -> (String, TursoValues) {
         LockQuery::Hash(hash) => ("hash = ?1", vec![hash_blob(&hash)]),
         LockQuery::HashRepository(hash, repository) => (
             "hash = ?1 AND repository = ?2",
-            vec![
-                hash_blob(&hash),
-                crate::store::partition_blob(repository),
-            ],
+            vec![hash_blob(&hash), crate::store::partition_blob(repository)],
         ),
         LockQuery::HashRepositoryBranch(hash, repository, branch) => (
             "hash = ?1 AND repository = ?2 AND branch = ?3",
@@ -538,11 +530,7 @@ mod test {
             LockQuery::OwnerRepositoryBranch("owner".to_string(), repository, branch),
             LockQuery::Repository(repository),
             LockQuery::RepositoryBranch(repository, branch),
-            LockQuery::RepositoryBranchDescription(
-                repository,
-                branch,
-                "description".to_string(),
-            ),
+            LockQuery::RepositoryBranchDescription(repository, branch, "description".to_string()),
         ];
 
         for query in queries {
@@ -564,10 +552,7 @@ mod test {
     #[test]
     fn a_lock_status_check_asks_about_each_resource_exactly() {
         let repository = RepositoryId::default();
-        let resources = [
-            resource(1, 1, "one"),
-            resource(2, 2, "two"),
-        ];
+        let resources = [resource(1, 1, "one"), resource(2, 2, "two")];
 
         let keys = unique_keys(repository, &resources);
         let (sql, parameters) = check_locks_sql(&keys);

@@ -196,8 +196,8 @@ fn required(
     Err(PluginError::from(PluginConfigError {
         plugin_name: plugin_name.to_string(),
         message: format!(
-            "the configuration has no `{key}` in [plugins.{plugin_name}] and the {variable} \
-             environment variable is not set either"
+            "the configuration has no usable `{key}` in [plugins.{plugin_name}] and the \
+             {variable} environment variable is not set either"
         ),
     }))
 }

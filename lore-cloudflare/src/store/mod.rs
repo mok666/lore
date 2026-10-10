@@ -8,15 +8,14 @@
 pub mod lock_store;
 pub mod mutable_store;
 
-pub use lock_store::CloudflareLockStore;
-pub use mutable_store::CloudflareMutableStore;
-
 use libsql::Value;
+pub use lock_store::CloudflareLockStore;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_storage::KeyType;
 use lore_storage::StoreError;
+pub use mutable_store::CloudflareMutableStore;
 
 use crate::turso::TursoTransaction;
 
@@ -75,8 +74,10 @@ pub(crate) fn now_millis() -> u64 {
 /// An integer column as a count of milliseconds since the epoch.
 pub(crate) fn integer_to_millis(column: &str, value: &Value) -> Result<u64, StoreError> {
     match value {
-        Value::Integer(millis) => u64::try_from(*millis).map_err(|_| {
-            StoreError::internal(format!("column {column} was {millis}, which is before the epoch"))
+        Value::Integer(millis) => u64::try_from(*millis).map_err(|_before_the_epoch| {
+            StoreError::internal(format!(
+                "column {column} was {millis}, which is before the epoch"
+            ))
         }),
         other => Err(StoreError::internal(format!(
             "column {column} was {other:?}, not a count of milliseconds"
@@ -231,7 +232,10 @@ mod test {
         let mut branch = Context::default();
         branch.data_mut()[0] = 3;
 
-        assert_eq!(blob_to_context("branch", &context_blob(branch)).unwrap(), branch);
+        assert_eq!(
+            blob_to_context("branch", &context_blob(branch)).unwrap(),
+            branch
+        );
     }
 
     #[test]
@@ -244,6 +248,9 @@ mod test {
         let mut expected = repository.data().to_vec();
         expected.extend_from_slice(branch.data());
 
-        assert_eq!(repository_branch_blob(repository, branch), Value::Blob(expected));
+        assert_eq!(
+            repository_branch_blob(repository, branch),
+            Value::Blob(expected)
+        );
     }
 }
