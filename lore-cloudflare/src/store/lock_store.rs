@@ -7,6 +7,8 @@
 //! another client already holds writes nothing at all, because a caller that is told it failed
 //! must not have to wonder which part of it happened.
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -48,17 +50,24 @@ const SELECT_LOCKS: &str = "SELECT hash, repository, branch, owner_id, descripti
 /// than one per resource.
 const CHECK_LOCKS_CHUNK: usize = 50;
 
-/// Take a lock unless the row is already there.
-const LOCK_SQL: &str = "INSERT INTO locks \
-     (hash, repository_branch, repository, branch, owner_id, description, locked_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-     ON CONFLICT (hash, repository_branch) DO NOTHING";
+/// How many parameters one statement may be given.
+///
+/// The server this store talks to accepts far more than this — measured against `sqld v0.24.32`,
+/// 32766, above which it answers `too many SQL variables` — and 999 is the oldest limit any
+/// `SQLite` build has shipped, so a statement built to this budget runs anywhere the table can
+/// live. Locks are taken and released a statement at a time, and a request naming thousands of
+/// resources would otherwise cost a round trip per resource.
+pub const PARAMETER_BUDGET: usize = 999;
 
-/// Whose lock a row is.
-const OWNER_SQL: &str = "SELECT owner_id FROM locks WHERE hash = ?1 AND repository_branch = ?2";
+/// How many locks one insert statement takes: seven parameters each.
+const LOCK_INSERT_RESOURCES: usize = PARAMETER_BUDGET / 7;
 
-/// Release a lock. Whether it is there, and whose it was, is decided before this runs.
-const UNLOCK_SQL: &str = "DELETE FROM locks WHERE hash = ?1 AND repository_branch = ?2";
+/// How many locks one statement keyed by the row's own key can name: two parameters each.
+///
+/// The row is keyed by the hash and the `(repository, branch)` pair they are joined into, and that
+/// pair is what an insert conflicts on, so the statements that read around an insert and the ones
+/// that delete name exactly that pair.
+const LOCK_ROW_KEY_RESOURCES: usize = PARAMETER_BUDGET / 2;
 
 /// A lock store in a Turso database.
 pub struct CloudflareLockStore {
@@ -97,6 +106,10 @@ impl CloudflareLockStore {
     /// A candidate that was already held by the same owner is not an error and is not part of the
     /// answer: the caller hears about the locks this call took, and a retry of a request whose
     /// answer was lost takes nothing and says so.
+    ///
+    /// As many resources as one statement can hold are taken in one statement, and only the keys
+    /// that statement did not report are asked about — those, and no others, are the rows that
+    /// were already there (spec §4.6).
     async fn lock_resources_transaction(
         &self,
         owner_id: &str,
@@ -106,89 +119,78 @@ impl CloudflareLockStore {
         // One timestamp for the whole request, so the locks it takes look like one moment.
         let locked_at = crate::store::now_millis();
 
+        // A resource named twice is one row, so it is locked once and reported once.
+        let keys = unique_resources(resources);
+
         let transaction =
             self.executor.begin_immediate().await.map_err(|error| {
                 error.into_lock_error("opening a transaction to lock resources")
             })?;
 
-        let mut locked = Vec::with_capacity(resources.len());
+        // The keys the inserts took. `RETURNING` reports the rows an insert actually wrote, so a
+        // key that is missing from this set is a row that was already there, and the keys in it
+        // are the only rows that are this call's doing.
+        let mut taken: BTreeSet<(Hash, BranchId)> = BTreeSet::new();
 
-        for resource in resources {
-            let parameters = vec![
-                hash_blob(&resource.hash),
-                repository_branch_blob(repository, resource.branch),
-                crate::store::partition_blob(repository),
-                crate::store::context_blob(resource.branch),
-                Value::Text(owner_id.to_string()),
-                Value::Text(resource.description.clone()),
-                Value::Integer(locked_at as i64),
-            ];
+        for chunk in keys.chunks(LOCK_INSERT_RESOURCES) {
+            let (sql, parameters) = lock_sql(repository, chunk, owner_id, locked_at);
 
-            let taken = match transaction.execute(LOCK_SQL, parameters).await {
-                Ok(taken) => taken,
+            let rows = match transaction.query(&sql, parameters).await {
+                Ok(rows) => rows,
                 Err(error) => {
                     discard(transaction, "could not take a lock").await;
                     return Err(error.into_lock_error("taking a lock"));
                 }
             };
 
-            match taken {
-                1 => locked.push(LockData {
-                    resource: resource.clone(),
-                    owner: owner_id.to_string(),
-                    locked_at,
-                }),
-                0 => {
-                    // The row is already there. Whose it is decides whether this is a lock the
-                    // same owner already holds.
-                    let rows = match transaction
-                        .query(
-                            OWNER_SQL,
-                            vec![
-                                hash_blob(&resource.hash),
-                                repository_branch_blob(repository, resource.branch),
-                            ],
-                        )
-                        .await
-                    {
-                        Ok(rows) => rows,
-                        Err(error) => {
-                            discard(transaction, "could not read whose lock a row is").await;
-                            return Err(error.into_lock_error("reading a lock's owner"));
-                        }
-                    };
+            for row in &rows {
+                taken.insert(row_key(row, &sql).map_err(malformed)?);
+            }
+        }
 
-                    let Some(row) = rows.first() else {
-                        // The insert conflicted, so a row is there; not finding it means the
-                        // row changed underneath a transaction that holds the write lock.
-                        discard(transaction, "a conflicted row is not there").await;
-                        return Err(LockError::internal(
-                            "a lock insert conflicted, but the row it conflicted with is not \
-                             there",
-                        ));
-                    };
+        // Whose the rows that were already there are. The insert has one condition — the primary
+        // key — so it cannot have been refused for anything else, and every key it did not report
+        // is a lock somebody holds: this owner, or another one.
+        let conflicted: Vec<(Hash, BranchId)> = keys
+            .iter()
+            .map(|resource| (resource.hash, resource.branch))
+            .filter(|key| !taken.contains(key))
+            .collect();
 
-                    let owner = owner_of(row).map_err(malformed)?;
+        for chunk in conflicted.chunks(LOCK_ROW_KEY_RESOURCES) {
+            let (sql, parameters) = owner_sql(repository, chunk);
 
-                    if owner == owner_id {
-                        // Held by this owner already: nothing was taken here, so it is not part
-                        // of what this call took.
-                        continue;
-                    }
+            let rows = match transaction.query(&sql, parameters).await {
+                Ok(rows) => rows,
+                Err(error) => {
+                    discard(transaction, "could not read whose lock a row is").await;
+                    return Err(error.into_lock_error("reading a lock's owner"));
+                }
+            };
 
+            let owners: BTreeMap<(Hash, BranchId), String> = rows
+                .iter()
+                .map(|row| Ok((row_key(row, &sql)?, owner_of(row, &sql)?)))
+                .collect::<Result<_, StoreError>>()
+                .map_err(malformed)?;
+
+            for key in chunk {
+                let Some(owner) = owners.get(key) else {
+                    // The insert conflicted, so a row is there; not finding it means the row
+                    // changed underneath a transaction that holds the write lock.
+                    discard(transaction, "a conflicted row is not there").await;
+                    return Err(LockError::internal(
+                        "a lock insert conflicted, but the row it conflicted with is not there",
+                    ));
+                };
+
+                if owner != owner_id {
                     discard(transaction, "a resource is locked by another owner").await;
                     return Err(LockNotOwned.into());
                 }
-                other => {
-                    discard(
-                        transaction,
-                        "a lock insert reported an impossible row count",
-                    )
-                    .await;
-                    return Err(LockError::internal(format!(
-                        "taking a lock changed {other} rows, which is neither nothing nor one"
-                    )));
-                }
+
+                // Held by this owner already: nothing was taken here, so it is not part of what
+                // this call took.
             }
         }
 
@@ -196,6 +198,23 @@ impl CloudflareLockStore {
             .commit()
             .await
             .map_err(|error| error.into_lock_error("committing a lock request"))?;
+
+        // The request's own order, each resource once: a caller that asked about a set of
+        // resources can line the answer up with what it asked about.
+        let mut reported: BTreeSet<(Hash, BranchId)> = BTreeSet::new();
+        let mut locked = Vec::with_capacity(taken.len());
+
+        for resource in resources {
+            let key = (resource.hash, resource.branch);
+
+            if taken.contains(&key) && reported.insert(key) {
+                locked.push(LockData {
+                    resource: resource.clone(),
+                    owner: owner_id.to_string(),
+                    locked_at,
+                });
+            }
+        }
 
         Ok(locked)
     }
@@ -269,6 +288,9 @@ impl CloudflareLockStore {
     }
 
     /// Release every resource named, or none of them: one transaction, bounded by its caller.
+    ///
+    /// As many resources as one statement can hold are released in one statement, in the same
+    /// shape the lock request uses.
     async fn unlock_resources_transaction(
         &self,
         owner_id: &str,
@@ -276,6 +298,8 @@ impl CloudflareLockStore {
         repository: RepositoryId,
         resources: &[LockResource],
     ) -> Result<Vec<LockResource>, LockError> {
+        // A resource named twice is one row: releasing it twice would report a row that is not
+        // there, and asking whose it is twice is two reads of one answer.
         let keys = unique_resources(resources);
 
         let transaction =
@@ -283,20 +307,21 @@ impl CloudflareLockStore {
                 error.into_lock_error("opening a transaction to unlock resources")
             })?;
 
-        let mut missing = false;
+        if validate_user {
+            // Whose every lock is, before anything is removed. A row that belongs to someone else
+            // outranks a row that is not there, so the reads all happen and the foreign owner is
+            // what is reported when there is one.
+            let mut owner_of_key: BTreeMap<(Hash, BranchId), String> = BTreeMap::new();
 
-        for resource in &keys {
-            if validate_user {
-                let rows = match transaction
-                    .query(
-                        OWNER_SQL,
-                        vec![
-                            hash_blob(&resource.hash),
-                            repository_branch_blob(repository, resource.branch),
-                        ],
-                    )
-                    .await
-                {
+            for chunk in keys
+                .iter()
+                .map(|resource| (resource.hash, resource.branch))
+                .collect::<Vec<_>>()
+                .chunks(LOCK_ROW_KEY_RESOURCES)
+            {
+                let (sql, parameters) = owner_sql(repository, chunk);
+
+                let rows = match transaction.query(&sql, parameters).await {
                     Ok(rows) => rows,
                     Err(error) => {
                         discard(transaction, "could not read whose lock a row is").await;
@@ -304,42 +329,47 @@ impl CloudflareLockStore {
                     }
                 };
 
-                match rows.first() {
-                    // Not there: nothing to release. Whether that fails the request depends on
-                    // whether a row belonging to someone else turns up in the rest of the loop.
-                    None => {
-                        missing = true;
-                        continue;
-                    }
-                    Some(row) => {
-                        let owner = owner_of(row).map_err(malformed)?;
-
-                        if owner != owner_id {
-                            discard(transaction, "a resource is locked by another owner").await;
-                            return Err(LockNotOwned.into());
-                        }
-                    }
+                for row in &rows {
+                    owner_of_key.insert(
+                        row_key(row, &sql).map_err(malformed)?,
+                        owner_of(row, &sql).map_err(malformed)?,
+                    );
                 }
             }
 
-            if let Err(error) = transaction
-                .execute(
-                    UNLOCK_SQL,
-                    vec![
-                        hash_blob(&resource.hash),
-                        repository_branch_blob(repository, resource.branch),
-                    ],
-                )
-                .await
-            {
-                discard(transaction, "could not release a lock").await;
-                return Err(error.into_lock_error("releasing a lock"));
+            let mut missing = false;
+
+            for resource in &keys {
+                match owner_of_key.get(&(resource.hash, resource.branch)) {
+                    // Not there: nothing to release. Whether that fails the request depends on
+                    // whether a row belonging to someone else is behind one of the keys.
+                    None => missing = true,
+                    Some(owner) if owner != owner_id => {
+                        discard(transaction, "a resource is locked by another owner").await;
+                        return Err(LockNotOwned.into());
+                    }
+                    Some(_) => {}
+                }
+            }
+
+            if missing {
+                discard(transaction, "some resources are not locked").await;
+                return Err(LockNotFound.into());
             }
         }
 
-        if missing {
-            discard(transaction, "some resources are not locked").await;
-            return Err(LockNotFound.into());
+        for chunk in keys
+            .iter()
+            .map(|resource| (resource.hash, resource.branch))
+            .collect::<Vec<_>>()
+            .chunks(LOCK_ROW_KEY_RESOURCES)
+        {
+            let (sql, parameters) = unlock_sql(repository, chunk);
+
+            if let Err(error) = transaction.execute(&sql, parameters).await {
+                discard(transaction, "could not release a lock").await;
+                return Err(error.into_lock_error("releasing a lock"));
+            }
         }
 
         transaction
@@ -448,11 +478,15 @@ fn query_locks_sql(query: LockQuery) -> (String, TursoValues) {
     (format!("{SELECT_LOCKS} WHERE {condition}"), parameters)
 }
 
-/// One lock per resource, each resource once, in a settled order.
+/// One lock per resource, each resource's row once, in a settled order.
+///
+/// The row is what a duplicate is, not the whole resource: two requests that name the same hash
+/// and branch with different descriptions name one lock, and releasing or reading it twice would
+/// report a row that is not there and a second answer to one question.
 fn unique_resources(resources: &[LockResource]) -> Vec<LockResource> {
     let mut keys = resources.to_vec();
-    keys.sort();
-    keys.dedup();
+    keys.sort_by_key(|resource| (resource.hash, resource.branch));
+    keys.dedup_by(|a, b| a.hash == b.hash && a.branch == b.branch);
     keys
 }
 
@@ -493,9 +527,116 @@ fn check_locks_sql(keys: &[(Hash, RepositoryId, BranchId)]) -> (String, TursoVal
     (sql, parameters)
 }
 
+/// The statement that takes one group of locks, and its parameters.
+///
+/// `RETURNING` is what makes a group cost one statement: the rows it hands back are the locks it
+/// wrote, so a row that was already there is simply not among them. The insert has one condition —
+/// the primary key — and nothing else can make it fail, so a key that is not reported is a lock
+/// somebody already holds.
+fn lock_sql(
+    repository: RepositoryId,
+    resources: &[LockResource],
+    owner_id: &str,
+    locked_at: u64,
+) -> (String, TursoValues) {
+    let mut sql = String::from(
+        "INSERT INTO locks \
+         (hash, repository_branch, repository, branch, owner_id, description, locked_at) VALUES ",
+    );
+    let mut parameters = TursoValues::with_capacity(resources.len() * 7);
+
+    for (index, resource) in resources.iter().enumerate() {
+        let first = index * 7 + 1;
+
+        sql.push_str(if index == 0 { "(" } else { ", (" });
+        sql.push_str(&format!(
+            "?{first}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}",
+            first + 1,
+            first + 2,
+            first + 3,
+            first + 4,
+            first + 5,
+            first + 6
+        ));
+        sql.push(')');
+
+        parameters.push(hash_blob(&resource.hash));
+        parameters.push(repository_branch_blob(repository, resource.branch));
+        parameters.push(crate::store::partition_blob(repository));
+        parameters.push(crate::store::context_blob(resource.branch));
+        parameters.push(Value::Text(owner_id.to_string()));
+        parameters.push(Value::Text(resource.description.clone()));
+        parameters.push(Value::Integer(locked_at as i64));
+    }
+
+    sql.push_str(
+        " ON CONFLICT (hash, repository_branch) DO NOTHING RETURNING hash, repository, branch",
+    );
+
+    (sql, parameters)
+}
+
+/// The statement that asks whose a group of locks is, and its parameters.
+///
+/// It names the pair the insert conflicts on, one predicate per key.
+fn owner_sql(repository: RepositoryId, keys: &[(Hash, BranchId)]) -> (String, TursoValues) {
+    let mut sql = String::from("SELECT hash, repository, branch, owner_id FROM locks");
+    let mut parameters = TursoValues::with_capacity(keys.len() * 2);
+
+    for (index, (hash, branch)) in keys.iter().enumerate() {
+        let first = index * 2 + 1;
+
+        sql.push_str(if index == 0 { " WHERE " } else { " OR " });
+        sql.push_str(&format!(
+            "(hash = ?{first} AND repository_branch = ?{})",
+            first + 1
+        ));
+
+        parameters.push(hash_blob(hash));
+        parameters.push(repository_branch_blob(repository, *branch));
+    }
+
+    (sql, parameters)
+}
+
+/// The statement that releases a group of locks, and its parameters.
+///
+/// Whether each row is there, and whose it was, is decided before this runs.
+fn unlock_sql(repository: RepositoryId, keys: &[(Hash, BranchId)]) -> (String, TursoValues) {
+    let mut sql = String::from("DELETE FROM locks");
+    let mut parameters = TursoValues::with_capacity(keys.len() * 2);
+
+    for (index, (hash, branch)) in keys.iter().enumerate() {
+        let first = index * 2 + 1;
+
+        sql.push_str(if index == 0 { " WHERE " } else { " OR " });
+        sql.push_str(&format!(
+            "(hash = ?{first} AND repository_branch = ?{})",
+            first + 1
+        ));
+
+        parameters.push(hash_blob(hash));
+        parameters.push(repository_branch_blob(repository, *branch));
+    }
+
+    (sql, parameters)
+}
+
+/// The rows a `locks` table is read as for a `RETURNING` or keyed statement: `hash, repository,
+/// branch, …`. The key is the hash and the branch, the two columns every one of those rows starts
+/// with.
+fn row_key(row: &[Value], sql: &str) -> Result<(Hash, BranchId), StoreError> {
+    Ok((
+        blob_to_hash("hash", cell(row, 0, sql)?)?,
+        blob_to_context("branch", cell(row, 2, sql)?)?,
+    ))
+}
+
 /// Whose lock a row read for its owner alone is.
-fn owner_of(row: &[Value]) -> Result<String, StoreError> {
-    blob_to_string("owner_id", cell(row, 0, OWNER_SQL)?)
+fn owner_of(row: &[Value], sql: &str) -> Result<String, StoreError> {
+    // The owner is the last column of every row these statements read, after the two key columns
+    // and the repository between them.
+    blob_to_string("owner_id", cell(row, 3, sql)?)
 }
 
 /// One row of a lock table, as the store reports it.
@@ -622,11 +763,12 @@ mod test {
     }
 
     #[test]
-    fn unlocking_takes_each_resource_once_and_settles_the_order() {
+    fn unlocking_takes_each_row_once_and_settles_the_order() {
         let resources = [
             resource(2, 2, "two"),
             resource(1, 1, "one"),
-            resource(2, 2, "two"),
+            // The same row as the first, described differently: one lock, not two.
+            resource(2, 2, "two, again"),
         ];
 
         let keys = unique_resources(&resources);
@@ -634,6 +776,100 @@ mod test {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].hash, Hash::from_u64(1));
         assert_eq!(keys[1].hash, Hash::from_u64(2));
+        assert_eq!(
+            keys[1].description, "two",
+            "the first of the equal rows is the one kept"
+        );
+    }
+
+    #[test]
+    fn a_group_is_taken_by_one_statement() {
+        let repository = RepositoryId::default();
+        let resources = [resource(1, 1, "one"), resource(2, 2, "two")];
+
+        let (sql, parameters) = lock_sql(repository, &resources, "owner", 7);
+
+        assert!(sql.starts_with("INSERT INTO locks"), "{sql}");
+        assert!(
+            sql.contains("VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7), (?8, "),
+            "{sql}"
+        );
+        assert!(sql.ends_with("ON CONFLICT (hash, repository_branch) DO NOTHING RETURNING hash, repository, branch"), "{sql}");
+        assert_eq!(parameters.len(), 14);
+        assert_eq!(sql.matches('?').count(), 14);
+    }
+
+    #[test]
+    fn a_group_is_asked_about_and_released_by_one_statement_each() {
+        let repository = RepositoryId::default();
+        let keys = vec![
+            (Hash::from_u64(1), BranchId::default()),
+            (Hash::from_u64(2), BranchId::default()),
+        ];
+
+        let (owner_statement, owner_parameters) = owner_sql(repository, &keys);
+
+        assert!(
+            owner_statement.starts_with("SELECT hash, repository, branch, owner_id FROM locks"),
+            "{owner_statement}"
+        );
+        assert!(
+            owner_statement.contains(
+                "WHERE (hash = ?1 AND repository_branch = ?2) OR (hash = ?3 AND \
+                 repository_branch = ?4)"
+            ),
+            "{owner_statement}"
+        );
+        assert_eq!(owner_parameters.len(), 4);
+
+        let (unlock_statement, unlock_parameters) = unlock_sql(repository, &keys);
+
+        assert!(
+            unlock_statement.contains(
+                "DELETE FROM locks WHERE (hash = ?1 AND repository_branch = ?2) OR (hash = ?3 \
+                 AND repository_branch = ?4)"
+            ),
+            "{unlock_statement}"
+        );
+        assert_eq!(unlock_parameters.len(), 4);
+        assert_eq!(unlock_statement.matches('?').count(), 4);
+    }
+
+    /// A group of the largest shape is inside the parameter budget, and a request larger than a
+    /// group is cut into groups that each are.
+    #[test]
+    fn a_group_stays_inside_the_parameter_budget() {
+        let repository = RepositoryId::default();
+
+        let resources: Vec<LockResource> = (0..LOCK_INSERT_RESOURCES + 1)
+            .map(|index| resource(index as u64, 1, "resource"))
+            .collect();
+
+        let (_, parameters) = lock_sql(repository, &resources[..LOCK_INSERT_RESOURCES], "owner", 1);
+        assert_eq!(parameters.len(), LOCK_INSERT_RESOURCES * 7);
+        assert!(parameters.len() <= PARAMETER_BUDGET);
+
+        let (_, parameters) = lock_sql(repository, &resources, "owner", 1);
+        assert!(
+            parameters.len() > PARAMETER_BUDGET,
+            "a chunk is what keeps a request inside the budget"
+        );
+        for chunk in resources.chunks(LOCK_INSERT_RESOURCES) {
+            let (sql, parameters) = lock_sql(repository, chunk, "owner", 1);
+            assert!(parameters.len() <= PARAMETER_BUDGET, "{sql}");
+        }
+
+        let keys: Vec<(Hash, BranchId)> = (0..LOCK_ROW_KEY_RESOURCES + 1)
+            .map(|index| (Hash::from_u64(index as u64), BranchId::default()))
+            .collect();
+
+        for chunk in keys.chunks(LOCK_ROW_KEY_RESOURCES) {
+            let (sql, parameters) = owner_sql(repository, chunk);
+            assert!(parameters.len() <= PARAMETER_BUDGET, "{sql}");
+
+            let (sql, parameters) = unlock_sql(repository, chunk);
+            assert!(parameters.len() <= PARAMETER_BUDGET, "{sql}");
+        }
     }
 
     #[test]
