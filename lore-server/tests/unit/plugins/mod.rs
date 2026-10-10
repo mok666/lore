@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 mod aws;
+mod cloudflare;
 mod hashicorp;
 mod registry;
 mod traits;
