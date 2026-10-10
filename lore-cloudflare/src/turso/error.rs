@@ -105,9 +105,14 @@ impl TursoError {
     /// - An exchange that ended early says so: `http error`, `Failed to connect to database`,
     ///   `stream closed`, `unexpected response` and `json error` all name what went wrong in
     ///   front of the text the server sent back.
+    /// - A status the driver refused to read as an answer is the request going out and the answer
+    ///   not coming back with it, which is the case this crate must not guess about. Any status,
+    ///   `429` or a 5xx, may be an answer that was lost rather than a request that was refused —
+    ///   and so may an expired stream, which the server refuses as `STREAM_EXPIRED` without
+    ///   running the statement. All of them are [`TursoErrorKind::Disconnected`] (spec §4.6).
     /// - A statement the server refused for a lock reason arrives as the `Debug` form of the
     ///   statement error it carries: a message, and a code of `SQLITE_BUSY` or `SQLITE_LOCKED`.
-    /// - A quota refusal arrives as an api error carrying `BLOCKED`.
+    /// - A quota refusal arrives as a body carrying `BLOCKED`.
     ///
     /// Anything unrecognised is [`TursoErrorKind::Internal`]: an error this crate does not
     /// understand is not one it should quietly retry.
@@ -121,12 +126,26 @@ impl TursoError {
             return TursoErrorKind::Disconnected;
         }
 
-        if message.contains("SQLITE_BUSY") || message.contains("SQLITE_LOCKED") {
-            return TursoErrorKind::SlowDown;
-        }
-
+        // Before the statuses below: a quota refusal is not a lost answer however it arrives, and
+        // it is the one kind nobody may retry. Measured against `v0.24.32`, the body is
+        // `{"error":"BLOCKED: ..."}` behind a status of its own.
         if message.contains("BLOCKED") {
             return TursoErrorKind::Maintenance;
+        }
+
+        // Measured against `v0.24.32`: an answer the server refuses for a reason of its own comes
+        // back as `status=503 Service Unavailable`, and one it refuses because the stream is gone
+        // as `status=400 Bad Request` with `STREAM_EXPIRED` in the body. Neither is a statement
+        // the server read and rejected — those arrive inside a `200`, as the codes below do — and
+        // neither says whether the statement ran, so both are treated as an answer that was lost.
+        if message.contains("STREAM_EXPIRED")
+            || matches!(api_error_status(message), Some(429 | 500..=599))
+        {
+            return TursoErrorKind::Disconnected;
+        }
+
+        if message.contains("SQLITE_BUSY") || message.contains("SQLITE_LOCKED") {
+            return TursoErrorKind::SlowDown;
         }
 
         TursoErrorKind::Internal
@@ -191,6 +210,16 @@ impl TursoError {
             }
         }
     }
+}
+
+/// The status of the driver's api error, where the text is one.
+///
+/// A non-200 answer is written as `status=503 Service Unavailable, body=…`
+/// (`libsql-0.9.30/src/hrana/hyper.rs:90`), so the answer's own status is the three digits after
+/// the marker. They are read from the first marker, which is the driver's; a body that happens to
+/// spell one out comes after it and cannot be mistaken for it.
+fn api_error_status(message: &str) -> Option<u16> {
+    message.split_once("status=")?.1.get(..3)?.parse().ok()
 }
 
 impl fmt::Display for TursoError {
@@ -266,12 +295,71 @@ mod test {
         );
     }
 
+    /// A refusal on account grounds outranks the status it arrives behind: it is the one kind
+    /// that must not be read as a lost answer, whatever status carried it.
+    #[test]
+    fn a_blocked_account_is_maintenance_behind_any_status() {
+        assert_eq!(
+            TursoError::classify(
+                "api error: `status=429 Too Many Requests, body={\"error\":\"BLOCKED: over quota\"}`"
+            ),
+            TursoErrorKind::Maintenance
+        );
+    }
+
+    /// The statuses that mean the request went out and no answer to it came back (spec §4.6).
+    #[test]
+    fn a_status_that_lost_the_answer_is_disconnected() {
+        for message in [
+            "api error: `status=429 Too Many Requests, body={\"error\":\"too many requests\"}`",
+            "api error: `status=500 Internal Server Error, body=`",
+            "api error: `status=502 Bad Gateway, body=`",
+            "api error: `status=503 Service Unavailable, body=`",
+            "api error: `status=504 Gateway Timeout, body=`",
+        ] {
+            assert_eq!(
+                TursoError::classify(message),
+                TursoErrorKind::Disconnected,
+                "{message}"
+            );
+        }
+    }
+
+    /// Measured against `v0.24.32`: a request on a stream the server has dropped is refused with
+    /// this answer, and the statement in it was not run.
+    #[test]
+    fn an_expired_stream_is_disconnected() {
+        assert_eq!(
+            TursoError::classify(
+                "api error: `status=400 Bad Request, body={\"message\":\"The stream has expired due to inactivity\",\"code\":\"STREAM_EXPIRED\"}`"
+            ),
+            TursoErrorKind::Disconnected
+        );
+    }
+
+    /// A status that carried an answer is not a lost answer: the statement it names, or the
+    /// credential it was sent with, is what went wrong.
+    #[test]
+    fn a_status_that_answered_is_not_a_lost_answer() {
+        for message in [
+            "api error: `status=400 Bad Request, body=Received an invalid baton`",
+            "api error: `status=401 Unauthorized, body=`",
+            "api error: `status=403 Forbidden, body={\"error\":\"forbidden\"}`",
+            "api error: `status=404 Not Found, body={\"error\":\"not found\"}`",
+        ] {
+            assert_eq!(
+                TursoError::classify(message),
+                TursoErrorKind::Internal,
+                "{message}"
+            );
+        }
+    }
+
     #[test]
     fn anything_else_is_internal() {
         for message in [
             "API misuse: `connection is closed`",
             "syntax error around L1:7: `near \"SELCT\": syntax error`",
-            "api error: `status=404 Not Found, body={\"error\":\"not found\"}`",
         ] {
             assert_eq!(
                 TursoError::classify(message),
