@@ -39,3 +39,13 @@ services:
     volumes:
       - ./consul-data:/consul/data
     command: agent -data-dir=/consul/node-1/data -node=consul-node-1 -retry-join=consul-server
+  # The libSQL server the Cloudflare plugin's stores talk to. It takes no token, so the fork's CI
+  # can run the integration tests without a secret, and the tag is the one the stores were
+  # measured against. The container answers the HTTP API on 8080; a test reaches it with
+  # `LORE_TURSO_URL=http://127.0.0.1:8080` (`http://sqld:8080` between containers).
+  sqld:
+    image: ghcr.io/tursodatabase/libsql-server:v0.24.32
+    ports:
+      - "8080:8080"
+    init: true
+    restart: on-failure
