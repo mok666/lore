@@ -469,6 +469,10 @@ impl R2Client for S3R2Client {
 /// lost data — a throttle recorded as data loss would then clear a state row. Reporting a refused
 /// credential as an overload would retry a request that can never succeed.
 ///
+/// A 404 is not one thing either, so it is read from its code rather than from its status: the
+/// object not being there is `NoSuchKey`, and a bucket this deployment does not have
+/// (`NoSuchBucket`) is a configuration error, not an answer that the content is gone.
+///
 /// This is a deliberate departure from the AWS store, which reports every S3 failure as
 /// `SlowDown`: a wrong key there is retried until the caller gives up.
 fn classify<E>(error: &AwsError<SdkError<E>>) -> R2Error
@@ -484,16 +488,32 @@ where
     match &**sdk_error {
         SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) => R2Error::SlowDown,
         SdkError::ServiceError(service) => {
-            let status = service.raw().status().as_u16();
-            let code = service.err().code().unwrap_or("<no code>");
-
-            match status {
-                404 => R2Error::NotFound,
-                429 | 500..=599 => R2Error::SlowDown,
-                _ => R2Error::Failed(format!("R2 answered HTTP {status} ({code})")),
-            }
+            service_error(service.raw().status().as_u16(), service.err().code())
         }
         _ => R2Error::Failed(format!("{sdk_error:?}")),
+    }
+}
+
+/// The kind a service error with this status and this code means.
+///
+/// A `HEAD` carries no body, so the SDK fills a 404's code in itself: it records `NotFound`
+/// (`aws-sdk-s3-1.133.0/src/protocol_serde.rs:23-30` — "S3 HEAD responses have no response body
+/// [to] for an error code"). Both names are therefore the object not being there, and every other
+/// code behind a 404 is something the caller cannot fix by asking again.
+fn service_error(status: u16, code: Option<&str>) -> R2Error {
+    match status {
+        404 => match code {
+            Some("NoSuchKey" | "NotFound") => R2Error::NotFound,
+            other => R2Error::Failed(format!(
+                "R2 answered HTTP 404 ({})",
+                other.unwrap_or("<no code>")
+            )),
+        },
+        429 | 500..=599 => R2Error::SlowDown,
+        _ => R2Error::Failed(format!(
+            "R2 answered HTTP {status} ({})",
+            code.unwrap_or("<no code>")
+        )),
     }
 }
 
@@ -591,5 +611,51 @@ mod test {
         assert!(printed.contains("403"), "{printed}");
         assert!(printed.contains("reading a payload"), "{printed}");
         assert!(matches!(error, StoreError::Internal(_)), "{error:?}");
+    }
+
+    /// A 404 says which absence it is (spec §3.5).
+    #[test]
+    fn a_not_found_is_read_from_the_code_behind_it() {
+        assert!(matches!(
+            service_error(404, Some("NoSuchKey")),
+            R2Error::NotFound
+        ));
+        // The name the SDK records itself for a `HEAD`, which has no body to carry a code.
+        assert!(matches!(
+            service_error(404, Some("NotFound")),
+            R2Error::NotFound
+        ));
+        // A GET whose 404 carries no code at all is the same `HEAD` shape.
+        assert!(matches!(service_error(404, None), R2Error::Failed(_)));
+
+        for code in ["NoSuchBucket", "AccessDenied"] {
+            let error = service_error(404, Some(code));
+            assert!(matches!(error, R2Error::Failed(_)), "{code}: {error:?}");
+
+            let printed = format!("{error:?}");
+            assert!(printed.contains("404"), "{printed}");
+            assert!(printed.contains(code), "{printed}");
+        }
+    }
+
+    /// A refusal or a server that did not answer: the first is not retried, the second is.
+    #[test]
+    fn a_failure_that_is_not_a_404_is_read_from_the_status() {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(
+                matches!(service_error(status, None), R2Error::SlowDown),
+                "{status}"
+            );
+        }
+
+        for status in [400, 401, 403] {
+            assert!(
+                matches!(
+                    service_error(status, Some("AccessDenied")),
+                    R2Error::Failed(_)
+                ),
+                "{status}"
+            );
+        }
     }
 }
