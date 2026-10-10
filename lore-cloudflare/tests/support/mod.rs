@@ -36,6 +36,14 @@
 //! created, which on `MinIO` is every bucket the first time. Nothing is dropped afterwards — the
 //! content is addressed by a hash nobody else picks, so leftovers cost disk and nothing else.
 //!
+//! # Reading a failure
+//!
+//! The store translates a driver failure into a `StoreError` and writes the driver's own words to
+//! `tracing`, which a test binary otherwise has no subscriber for. `install_tracing` gives it one,
+//! so a red run against a real server can say what it was that did not answer. `RUST_LOG` chooses
+//! the level and the targets (`RUST_LOG=lore_cloudflare=debug,warn`); the default `warn` is the
+//! level the translations themselves log at.
+//!
 //! # When the server stops answering
 //!
 //! The pinned server can stop answering on the write path while reads keep working: measured on
@@ -52,6 +60,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use lore_base::types::Context;
@@ -79,6 +88,41 @@ use lore_cloudflare::turso::TursoValues;
 use lore_revision::lock::LockError;
 use lore_revision::lock::LockStore;
 use tokio::sync::OnceCell;
+use tracing_subscriber::EnvFilter;
+
+// =============================================================================
+// What the store only knows how to log
+// =============================================================================
+
+/// Send this crate's `tracing` events to the test's own output, once per test binary.
+///
+/// Every store method turns a driver failure into a `StoreError` and logs the reason the driver
+/// gave, because the contract's vocabulary is all a caller may act on and it is not fine enough to
+/// tell a timeout from a refused connection: `Disconnected` covers a request that never arrived, an
+/// answer that was cut off, and one this crate gave up waiting for. The store's own tests can
+/// script those, but an integration run meets them from a real server, and a run that reports
+/// `Disconnected` without the reason is a run that has to be repeated to learn anything.
+///
+/// `RUST_LOG` selects what is printed, in `tracing-subscriber`'s own syntax; the default is `warn`,
+/// which is the level those translations log at. The drivers' own events are below it and are
+/// available by target, for example `RUST_LOG=lore_cloudflare=debug,libsql=trace,warn`.
+///
+/// The writer is the test harness's: events are captured with the test that produced them, so a
+/// failing test shows them even without `--nocapture`, and `--nocapture` interleaves them in the
+/// order they happened.
+pub fn install_tracing() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+
+    INSTALLED.get_or_init(|| {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+
+        // A subscriber another library already installed is left alone.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .try_init();
+    });
+}
 
 // =============================================================================
 // The server under test
@@ -98,6 +142,8 @@ pub fn database_url() -> Option<String> {
 /// nothing to do with what the test is about.
 pub async fn client(label: &str) -> Option<TursoClient> {
     static SCHEMA: OnceCell<()> = const { OnceCell::const_new() };
+
+    install_tracing();
 
     let Some(url) = database_url() else {
         eprintln!(
@@ -192,6 +238,8 @@ pub fn r2_settings() -> Option<R2Settings> {
 
 /// A client over the bucket the environment names, or a report that this run has none.
 pub async fn r2(label: &str) -> Option<Arc<dyn R2Client>> {
+    install_tracing();
+
     let Some(settings) = r2_settings() else {
         eprintln!(
             "{label}: did not run — set LORE_R2_ENDPOINT_URL, LORE_R2_BUCKET, \

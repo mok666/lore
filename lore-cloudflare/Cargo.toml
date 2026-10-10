@@ -29,6 +29,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+# The integration tests run against real servers, whose failures the store can only describe by
+# logging: a `StoreError` says `Disconnected` and nothing more. Without a subscriber those events
+# go nowhere, so this is a dev-dependency rather than a runtime one.
+tracing-subscriber = { workspace = true }
 
 [features]
 default = []
