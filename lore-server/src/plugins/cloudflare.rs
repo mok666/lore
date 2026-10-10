@@ -80,9 +80,10 @@ pub struct CloudflarePluginConfig {
 
     /// The R2 bucket the immutable store's payloads live in.
     ///
-    /// The bucket name is not a secret — it appears in every request that reaches it and in the
-    /// url of every object — so it has no environment variable and belongs in this file, where a
-    /// bucket that is not the one meant is visible at a glance.
+    /// Not a secret — the name is in every request that reaches the bucket and in the url of
+    /// every object in it — but it still has an environment variable, so that a deployment can be
+    /// pointed at a bucket by name without a copy of its configuration file per environment.
+    /// Whatever it resolves to is logged at startup.
     #[serde(default)]
     pub s3_bucket: Option<String>,
 
@@ -252,7 +253,13 @@ impl CloudflarePluginConfig {
         plugin_name: &str,
         environment: &dyn Fn(&str) -> Option<String>,
     ) -> Result<R2Settings, PluginError> {
-        let bucket = configured(plugin_name, "s3_bucket", self.s3_bucket.as_deref())?;
+        let bucket = required(
+            plugin_name,
+            "s3_bucket",
+            "LORE_R2_BUCKET",
+            self.s3_bucket.as_deref(),
+            environment,
+        )?;
 
         // Required, and not merely optional as it is for the AWS plugin: an S3 client with no
         // endpoint goes to S3 itself, so a deployment that meant R2 and forgot this line would
@@ -325,29 +332,6 @@ fn required(
         message: format!(
             "the configuration has no usable `{key}` in [plugins.{plugin_name}] and the \
              {variable} environment variable is not set either"
-        ),
-    }))
-}
-
-/// A key that has to be there, from the configuration alone.
-///
-/// For a value that has no environment variable because it is not a secret — the bucket name is
-/// in every url that reaches it — the error names the section rather than sending the operator
-/// looking for a variable that does not exist.
-fn configured(
-    plugin_name: &str,
-    key: &str,
-    configured: Option<&str>,
-) -> Result<String, PluginError> {
-    if let Some(value) = configured.filter(|value| !value.trim().is_empty()) {
-        return Ok(value.to_string());
-    }
-
-    Err(PluginError::from(PluginConfigError {
-        plugin_name: plugin_name.to_string(),
-        message: format!(
-            "the configuration has no usable `{key}` in [plugins.{plugin_name}]; this key has no \
-             environment variable and belongs in the configuration file"
         ),
     }))
 }
