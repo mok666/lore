@@ -17,6 +17,8 @@
 mod support;
 
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -29,6 +31,7 @@ use lore_revision::lock::LockQuery;
 use lore_revision::lock::LockStore;
 use support::FlakyExecutor;
 use support::LostCommitExecutor;
+use support::RecordingExecutor;
 use support::StatementLog;
 
 /// A resource no other test has locked.
@@ -190,6 +193,89 @@ async fn duplicate_resources_collapse_to_one_lock() {
             "every resource in the request is released"
         );
     }
+}
+
+/// A request that names hundreds of resources costs a handful of statements.
+///
+/// Taking and releasing locks are one transaction each, and a statement per resource would make a
+/// large push cost hundreds of round trips inside a transaction the server abandons after five
+/// seconds (spec §4.6). A request names as many resources as one statement can hold, and as many
+/// statements as that takes — which for 200 resources is two to take them and one to release them,
+/// in either case well inside the interactive transaction limit.
+#[tokio::test]
+async fn a_large_lock_request_costs_a_handful_of_statements() {
+    let Some(client) = support::client("a large lock request").await else {
+        return;
+    };
+
+    let log = Arc::new(StatementLog::default());
+    let executor: Arc<dyn TursoExecutor> =
+        Arc::new(RecordingExecutor::new(Arc::new(client), log.clone()));
+    let store = support::lock_store(executor);
+
+    let owner = support::random_owner();
+    let repository = support::random_partition();
+    let resources: Vec<LockResource> = (0..200).map(|_| random_resource()).collect();
+
+    let started = Instant::now();
+    let taken = support::take_locks(&store, &owner, repository, &resources)
+        .await
+        .expect("the resources are free");
+    let taking = started.elapsed();
+
+    assert_eq!(taken.len(), 200, "every resource is locked once");
+
+    // Counted from the last `BEGIN IMMEDIATE`: a request that met another writer and was reissued
+    // is the caller's retry, not this request's cost.
+    let statements = statements_of_the_last_attempt(&log.take());
+    assert!(
+        statements <= 6,
+        "200 resources cost {statements} statements: {:?}",
+        log.take()
+    );
+
+    let started = Instant::now();
+    let released = support::release_locks(&store, &owner, true, repository, &resources)
+        .await
+        .expect("the resources are ours to release");
+    let releasing = started.elapsed();
+
+    assert_eq!(released.len(), 200, "every resource is released once");
+
+    let statements = statements_of_the_last_attempt(&log.take());
+    assert!(
+        statements <= 6,
+        "releasing 200 resources cost {statements} statements: {:?}",
+        log.take()
+    );
+
+    for resource in &resources {
+        assert_eq!(
+            holders(&store, repository, resource).await,
+            0,
+            "every resource in the request is released"
+        );
+    }
+
+    // The interactive transaction limit the plan names is five seconds. Reported rather than only
+    // asserted, because it is the number the statement count is there to keep down.
+    eprintln!("200 locks: taking {taking:?}, releasing {releasing:?}");
+    for elapsed in [taking, releasing] {
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "one request has to finish inside the interactive transaction limit: {elapsed:?}"
+        );
+    }
+}
+
+/// How many statements the last attempt of a request made, from its own `BEGIN IMMEDIATE` on.
+fn statements_of_the_last_attempt(statements: &[String]) -> usize {
+    let started = statements
+        .iter()
+        .rposition(|statement| statement == "begin immediate")
+        .unwrap_or(0);
+
+    statements.len() - started
 }
 
 /// Unlocking a resource held by someone else deletes nothing, not even the caller's own locks in
