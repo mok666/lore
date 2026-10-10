@@ -359,7 +359,8 @@ fn test_the_immutable_config_is_validated_without_reaching_a_service() {
 /// been.
 #[test]
 fn test_the_r2_keys_are_required() {
-    // The bucket has no environment variable at all, because it is not a secret.
+    // The bucket has an environment variable of its own, because it is the one key that differs
+    // between a rehearsal and the real thing.
     let error = resolve_r2("")
         .expect_err("a bucket is required")
         .as_plugin_config_error()
@@ -368,7 +369,7 @@ fn test_the_r2_keys_are_required() {
         .clone();
 
     assert!(error.contains("s3_bucket"), "got: {error}");
-    assert!(error.contains("[plugins.cloudflare]"), "got: {error}");
+    assert!(error.contains("LORE_R2_BUCKET"), "got: {error}");
 
     let error = resolve_r2(r#"s3_bucket = "bucket""#)
         .expect_err("an endpoint is required")
