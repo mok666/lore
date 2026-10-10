@@ -6,25 +6,33 @@ publish = false
 
 [dependencies]
 async-trait = { workspace = true }
+# The S3 subset of R2 that the immutable store speaks, and the client that reaches it, are the
+# ones `lore-aws` already has: an R2 bucket is an S3 bucket at a different endpoint. The crate is
+# reused rather than reimplemented so that the two stores cannot drift apart, and so that the
+# request signing, the telemetry and the retry the AWS SDK applies are the same on both.
+aws-sdk-s3 = { version = "1.121.0", default-features = false, features = [
+    "rt-tokio",
+] }
+# Only for `ProvideErrorMetadata`, which is how an S3 failure is told apart from another.
+aws-smithy-types = { version = "1.4.3", default-features = false }
+bytes = { workspace = true }
 libsql = { version = "0.9.30", default-features = false, features = [
     "remote",
     "tls",
 ] }
+lore-aws = { workspace = true }
 lore-base = { workspace = true }
 lore-revision = { workspace = true }
 lore-storage = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
-# The immutable store (R2), and the `bytes` / `chrono` / `serde` / `toml` that read its
-# configuration, are not implemented yet. Their dependencies arrive with the code that uses them,
-# so that nothing here is declared and unused.
 [dev-dependencies]
 rand = { workspace = true }
 
 [features]
 default = []
-# The integration tests reach a real libSQL server, so CI has to be asked for them. Without the
-# feature they are not built at all; with it they still skip a test whose server is not configured
-# (see `tests/support/mod.rs`).
+# The integration tests reach a real libSQL server and a real S3 endpoint (MinIO in development),
+# so CI has to be asked for them. Without the feature they are not built at all; with it they still
+# skip a test whose server is not configured (see `tests/support/mod.rs`).
 integration_tests = []

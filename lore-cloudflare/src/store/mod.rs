@@ -1,14 +1,20 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! The stores Turso holds: the mutable key-value store, and the lock store.
+//! The stores Turso and R2 hold: the mutable key-value store, the lock store, and the immutable
+//! store of payloads.
 //!
-//! Both speak SQL through a [`TursoExecutor`](crate::turso::TursoExecutor), so both can be run
-//! against a server in a test without a server, and neither knows how the connection is made.
+//! The Turso stores speak SQL through a [`TursoExecutor`](crate::turso::TursoExecutor) and the
+//! immutable store reads and writes objects through an [`R2Client`], so each can be run in a test
+//! without the service behind it, and none of them knows how its connection is made.
 
+pub mod immutable_store;
 pub mod lock_store;
 pub mod mutable_store;
+pub mod r2;
 
 use libsql::Value;
+pub use immutable_store::CloudflareImmutableStore;
+pub use immutable_store::CloudflareImmutableStoreSettings;
 pub use lock_store::CloudflareLockStore;
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -16,6 +22,14 @@ use lore_base::types::Partition;
 use lore_storage::KeyType;
 use lore_storage::StoreError;
 pub use mutable_store::CloudflareMutableStore;
+pub use r2::R2Client;
+pub use r2::R2ConnectError;
+pub use r2::R2Credentials;
+pub use r2::R2Error;
+pub use r2::R2Object;
+pub use r2::R2Settings;
+pub use r2::S3R2Client;
+pub use r2::connect as connect_r2;
 
 use crate::turso::TursoTransaction;
 
@@ -58,6 +72,17 @@ pub(crate) fn repository_branch_blob(repository: Partition, branch: Context) -> 
     let mut bytes = Vec::with_capacity(PARTITION_LEN * 2);
     bytes.extend_from_slice(repository.data());
     bytes.extend_from_slice(branch.data());
+    Value::Blob(bytes)
+}
+
+/// The partition and the address context as the one key a fragment association is stored under.
+///
+/// The column is named `repository_context` after the two halves, and predates the split between
+/// a repository and the address whose context it is; the order is the partition first.
+pub(crate) fn repository_context_blob(partition: Partition, context: Context) -> Value {
+    let mut bytes = Vec::with_capacity(PARTITION_LEN * 2);
+    bytes.extend_from_slice(partition.data());
+    bytes.extend_from_slice(context.data());
     Value::Blob(bytes)
 }
 
@@ -139,6 +164,25 @@ pub(crate) fn blob_to_context(column: &str, value: &Value) -> Result<Context, St
         }
         other => Err(StoreError::internal(format!(
             "column {column} was {other:?}, not a {PARTITION_LEN}-byte branch"
+        ))),
+    }
+}
+
+/// The context half of a `repository_context` column, which is a partition followed by the
+/// context of the address that was associated.
+pub(crate) fn context_from_repository_context(
+    column: &str,
+    value: &Value,
+) -> Result<Context, StoreError> {
+    match value {
+        Value::Blob(bytes) if bytes.len() == PARTITION_LEN * 2 => {
+            let mut context = Context::default();
+            context.data_mut().copy_from_slice(&bytes[PARTITION_LEN..]);
+            Ok(context)
+        }
+        other => Err(StoreError::internal(format!(
+            "column {column} was {other:?}, not a {}-byte repository and context",
+            PARTITION_LEN * 2
         ))),
     }
 }
@@ -252,5 +296,28 @@ mod test {
             repository_branch_blob(repository, branch),
             Value::Blob(expected)
         );
+    }
+
+    #[test]
+    fn an_association_key_is_the_partition_followed_by_the_context() {
+        let mut partition = Partition::default();
+        partition.data_mut()[0] = 1;
+        let mut context = Context::default();
+        context.data_mut()[0] = 2;
+
+        let blob = repository_context_blob(partition, context);
+
+        let mut expected = partition.data().to_vec();
+        expected.extend_from_slice(context.data());
+        assert_eq!(blob, Value::Blob(expected));
+
+        assert_eq!(
+            context_from_repository_context("repository_context", &blob).unwrap(),
+            context
+        );
+
+        let error = context_from_repository_context("repository_context", &hash_blob(&Hash::default()))
+            .unwrap_err();
+        assert!(format!("{error}").contains("repository and context"));
     }
 }
