@@ -512,20 +512,73 @@ impl TursoExecutor for LostCommitExecutor {
             }
         };
 
-        Ok(Box::new(LostCommitTransaction {
+        Ok(Box::new(RecordingTransaction {
             inner: Some(transaction),
             log: self.log.clone(),
+            lose_commit: true,
         }))
     }
 }
 
-/// A transaction whose `COMMIT` reaches the server and whose answer does not come back.
-struct LostCommitTransaction {
-    inner: Option<Box<dyn TursoTransaction>>,
+/// An executor that passes every statement through and records it, so a test can count what one
+/// request cost.
+///
+/// The statements a request makes are the round trips it spends, and a store that asks about
+/// hundreds of resources has to spend a handful of them rather than one per resource (spec §4.6).
+/// The transaction is wrapped for the same reason [`LostCommitExecutor`] wraps it: what a request
+/// does between `BEGIN IMMEDIATE` and `COMMIT` is the whole of it, and none of it would show up
+/// otherwise.
+pub struct RecordingExecutor {
+    inner: Arc<dyn TursoExecutor>,
     log: Arc<StatementLog>,
 }
 
-impl LostCommitTransaction {
+impl RecordingExecutor {
+    pub fn new(inner: Arc<dyn TursoExecutor>, log: Arc<StatementLog>) -> Self {
+        Self { inner, log }
+    }
+}
+
+#[async_trait]
+impl TursoExecutor for RecordingExecutor {
+    async fn execute(&self, sql: &str, parameters: TursoValues) -> Result<u64, TursoError> {
+        self.log.add(format!("execute {sql}"));
+        self.inner.execute(sql, parameters).await
+    }
+
+    async fn query(&self, sql: &str, parameters: TursoValues) -> Result<Vec<TursoRow>, TursoError> {
+        self.log.add(format!("query {sql}"));
+        self.inner.query(sql, parameters).await
+    }
+
+    async fn batch(&self, sql: &str) -> Result<(), TursoError> {
+        self.log.add(format!("batch {sql}"));
+        self.inner.batch(sql).await
+    }
+
+    async fn begin_immediate(&self) -> Result<Box<dyn TursoTransaction>, TursoError> {
+        self.log.add("begin immediate");
+
+        // A request that meets another writer's transaction is reissued as it stands by the caller
+        // (`support::take_locks`), so nothing is waited for here.
+        let transaction = self.inner.begin_immediate().await?;
+
+        Ok(Box::new(RecordingTransaction {
+            inner: Some(transaction),
+            log: self.log.clone(),
+            lose_commit: false,
+        }))
+    }
+}
+
+/// A transaction that records what it is asked, and can lose the answer to its `COMMIT`.
+struct RecordingTransaction {
+    inner: Option<Box<dyn TursoTransaction>>,
+    log: Arc<StatementLog>,
+    lose_commit: bool,
+}
+
+impl RecordingTransaction {
     fn live(&self) -> &dyn TursoTransaction {
         self.inner
             .as_deref()
@@ -543,7 +596,7 @@ impl LostCommitTransaction {
 }
 
 #[async_trait]
-impl TursoTransaction for LostCommitTransaction {
+impl TursoTransaction for RecordingTransaction {
     async fn execute(&self, sql: &str, parameters: TursoValues) -> Result<u64, TursoError> {
         self.log.add(format!("execute {sql}"));
         self.live().execute(sql, parameters).await
@@ -559,12 +612,14 @@ impl TursoTransaction for LostCommitTransaction {
 
         let mut slot = *self;
 
+        let lose_commit = slot.lose_commit;
+
         match slot.take()?.commit().await {
             // The server applied it and the client never learned that it did.
-            Ok(()) => Err(TursoError::disconnected(
+            Ok(()) if lose_commit => Err(TursoError::disconnected(
                 "test: the answer to the commit was lost after the server applied it",
             )),
-            Err(error) => Err(error),
+            result => result,
         }
     }
 
@@ -640,6 +695,80 @@ impl TursoExecutor for FlakyExecutor {
 
     async fn begin_immediate(&self) -> Result<Box<dyn TursoTransaction>, TursoError> {
         self.spend("begin immediate")?;
+        self.inner.begin_immediate().await
+    }
+}
+
+/// An executor that loses the answer to the first statement matching a needle, after the server
+/// has run it.
+///
+/// This is the failure a write that cannot be reissued from outside must recover from itself: the
+/// statement arrived and did what it says, and the caller cannot tell that from a statement that
+/// never arrived. It is lost once, so the reissue the store makes can be answered (spec §4.6).
+pub struct LostStatementAnswerExecutor {
+    inner: Arc<dyn TursoExecutor>,
+    log: Arc<StatementLog>,
+    /// The statement whose answer is lost, matched as a substring of the SQL.
+    needle: String,
+    lost: Mutex<bool>,
+}
+
+impl LostStatementAnswerExecutor {
+    pub fn new(inner: Arc<dyn TursoExecutor>, log: Arc<StatementLog>, needle: &str) -> Self {
+        Self {
+            inner,
+            log,
+            needle: needle.to_string(),
+            lost: Mutex::new(false),
+        }
+    }
+
+    /// Whether this statement's answer is the one to lose, spending the loss.
+    fn loses_answer(&self, sql: &str) -> bool {
+        if !sql.contains(&self.needle) {
+            return false;
+        }
+
+        let mut lost = self.lost.lock().expect("the loss is not poisoned");
+
+        if *lost {
+            return false;
+        }
+
+        *lost = true;
+        true
+    }
+}
+
+#[async_trait]
+impl TursoExecutor for LostStatementAnswerExecutor {
+    async fn execute(&self, sql: &str, parameters: TursoValues) -> Result<u64, TursoError> {
+        self.log.add(format!("execute {sql}"));
+
+        // The server runs it first: what is lost is the answer, not the statement.
+        let changed = self.inner.execute(sql, parameters).await?;
+
+        if self.loses_answer(sql) {
+            return Err(TursoError::disconnected(
+                "test: the answer to the statement was lost after the server ran it",
+            ));
+        }
+
+        Ok(changed)
+    }
+
+    async fn query(&self, sql: &str, parameters: TursoValues) -> Result<Vec<TursoRow>, TursoError> {
+        self.log.add(format!("query {sql}"));
+        self.inner.query(sql, parameters).await
+    }
+
+    async fn batch(&self, sql: &str) -> Result<(), TursoError> {
+        self.log.add(format!("batch {sql}"));
+        self.inner.batch(sql).await
+    }
+
+    async fn begin_immediate(&self) -> Result<Box<dyn TursoTransaction>, TursoError> {
+        self.log.add("begin immediate");
         self.inner.begin_immediate().await
     }
 }

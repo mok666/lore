@@ -36,6 +36,8 @@ use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
 use lore_storage::conformance::Capabilities;
 use lore_storage::conformance::verify_immutable_store;
+use support::LostStatementAnswerExecutor;
+use support::StatementLog;
 
 /// The battery, as the store a deployment gets.
 #[tokio::test]
@@ -329,6 +331,80 @@ async fn an_obliterating_address_is_absent_from_a_batch_too() {
         query(&store, partition, obliterating).await,
         StoreMatch::MatchNone,
         "one address at a time gives the same answer as the batch it was in"
+    );
+}
+
+/// An obliteration whose mark was taken without an answer still finishes.
+///
+/// The mark is taken by a statement that says "move it if it is still where I read it", and the
+/// answer to it can be lost after the server applied it. Nothing can read that back: a moved row
+/// and another writer's move look the same afterwards, so a store that gave up would leave the
+/// hash marked as being obliterated forever — every write of it answers `SlowDown`, and no put can
+/// take it back (spec §4.6). The statement is reissued instead, which is what turns the moved row
+/// into an answer.
+#[tokio::test]
+async fn an_obliteration_survives_a_lost_answer_to_its_mark() {
+    let (Some(r2), Some(client)) = (
+        support::r2("an obliteration whose mark answer was lost").await,
+        support::client("an obliteration whose mark answer was lost").await,
+    ) else {
+        return;
+    };
+
+    let client = Arc::new(client);
+    let log = Arc::new(StatementLog::default());
+    let executor: Arc<dyn TursoExecutor> = Arc::new(LostStatementAnswerExecutor::new(
+        client.clone(),
+        log.clone(),
+        "UPDATE fragment_state",
+    ));
+    let store = support::immutable_store(r2.clone(), executor, false);
+    let (partition, address, payload, fragment) = a_fragment();
+    let key = object_key(address.hash);
+
+    put(&store, partition, address, fragment, &payload).await;
+
+    store
+        .clone()
+        .obliterate(partition, address, Default::default())
+        .await
+        .expect("an obliteration whose mark was taken without an answer still finishes");
+
+    let error = r2
+        .head_object(&key)
+        .await
+        .expect_err("the object is gone, not merely unreferenced");
+    assert!(matches!(error, R2Error::NotFound), "got: {error:?}");
+
+    assert_eq!(
+        query(&store, partition, address).await,
+        StoreMatch::MatchNone,
+        "the obliteration is complete: the content is not served from anywhere"
+    );
+
+    let state = client
+        .query(
+            "SELECT state FROM fragment_state WHERE hash = ?1",
+            vec![Value::Blob(address.hash.data().to_vec())],
+        )
+        .await
+        .expect("the state row can be read");
+
+    assert_eq!(
+        state.first().map(|row| row[0].clone()),
+        Some(Value::Integer(i64::from(
+            FragmentFlags::PayloadObliterated.bits()
+        ))),
+        "the hash is not left marked as being obliterated"
+    );
+
+    // The mark, lost as it was taken, reissued, and then the move that ends the obliteration: one
+    // statement per step, which is what the store spends and nothing more.
+    assert_eq!(
+        log.count("execute UPDATE fragment_state"),
+        3,
+        "{:?}",
+        log.take()
     );
 }
 

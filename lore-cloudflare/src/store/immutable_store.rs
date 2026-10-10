@@ -89,6 +89,7 @@ use crate::turso::TursoLimits;
 use crate::turso::TursoRow;
 use crate::turso::TursoValues;
 use crate::turso::retry::retry_within_deadline;
+use crate::turso::retry::with_deadline;
 
 // =============================================================================
 // The statements
@@ -603,25 +604,63 @@ impl CloudflareImmutableStore {
     }
 
     /// Move the state row from one state to another, failing if it has moved underneath us.
+    ///
+    /// The statement says "move it if it is still where I read it", so a report of no rows means
+    /// somebody else moved it first — except when no report came back at all. Turso cannot be asked
+    /// afterwards which of the two happened: the row a first, unanswered attempt moved is a row the
+    /// read sees in the target state, exactly as another writer's move would leave it.
+    ///
+    /// So a lost answer is reissued, and that is what makes the loss recoverable (spec §4.6): the
+    /// reissue is a fresh attempt at the same condition, and the row it did not move is a row the
+    /// unanswered attempt moved. Accepting the target state after a reissue keeps the mark an
+    /// obliteration takes exclusive in the ordinary case, where the statement reports what it did:
+    /// a plain conflict is still a conflict, and `revive_state`, which shares this statement, is
+    /// unaffected. A writer that lost its answer while another writer took the mark sees the same
+    /// target state and proceeds; the mark itself is one row, and the move that ends the
+    /// obliteration is a compare-and-set of its own, so the two do the same work rather than
+    /// disagreeing about the state.
     async fn advance_state(
         &self,
         hash: Hash,
         expected: FragmentState,
         updated: FragmentState,
     ) -> Result<(), StoreError> {
-        let moved = self
-            .execute(
-                ADVANCE_STATE_SQL,
-                vec![
-                    hash_blob(&hash),
-                    Value::Integer(i64::from(expected.bits())),
-                    Value::Integer(i64::from(updated.bits())),
-                ],
-                "moving a fragment state",
-            )
-            .await?;
+        let parameters = vec![
+            hash_blob(&hash),
+            Value::Integer(i64::from(expected.bits())),
+            Value::Integer(i64::from(updated.bits())),
+        ];
+
+        // Not `retry_within_deadline!`: that macro reports whatever the last attempt reported,
+        // and this statement has to know whether it ran again.
+        let (moved, reissued) = with_deadline(self.limits.timeout, async {
+            let mut waiter = self.limits.retry.waiter();
+            let mut reissued = false;
+
+            loop {
+                match self
+                    .executor
+                    .execute(ADVANCE_STATE_SQL, parameters.clone())
+                    .await
+                {
+                    Ok(moved) => break Ok((moved, reissued)),
+                    Err(error) if error.is_disconnected() && waiter.wait().await => {
+                        reissued = true;
+                        warn!(%hash, reason = %error.message(), "reissuing the fragment state move");
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        })
+        .await
+        .map_err(|error| error.into_store_error("moving a fragment state"))?;
 
         if moved == 1 {
+            return Ok(());
+        }
+
+        if reissued && self.load_state(hash).await? == Some(updated) {
+            debug!(%hash, "the reissued fragment state move found the state moved already");
             return Ok(());
         }
 
