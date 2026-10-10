@@ -442,8 +442,9 @@ impl ImmutableStorePluginFactory for CloudflareImmutableStorePluginFactory {
 
                 // Building the client asks the bucket whether it is there, so a bucket that cannot
                 // be reached, or keys that are not allowed to read it, stop the server at startup
-                // rather than at the first write.
-                let r2_client = connect_r2(&r2)
+                // rather than at the first write. Boxed because the client it builds is large
+                // enough that clippy counts the future against the caller's stack.
+                let r2_client = Box::pin(connect_r2(&r2))
                     .await
                     .map_err(|error| init_error(plugin_name, "the R2 client", error))?;
 
