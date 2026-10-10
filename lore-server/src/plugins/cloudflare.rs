@@ -54,6 +54,10 @@ use crate::plugins::PluginRegistry;
 #[lore_macro::test_pub]
 const PLUGIN_NAME: &str = "cloudflare";
 
+/// The region every R2 request is signed for when the configuration names none, which is the only
+/// value R2 has: the signature needs a region and the service reads nothing else out of it.
+const DEFAULT_R2_REGION: &str = "auto";
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -92,7 +96,8 @@ pub struct CloudflarePluginConfig {
     #[serde(default)]
     pub s3_endpoint_url: Option<String>,
 
-    /// The R2 region. Required by the signature only; R2 answers to `auto`.
+    /// The R2 region. Required by the signature only; R2 answers to `auto`, which is what is used
+    /// when the key is left out.
     #[serde(default)]
     pub s3_region: Option<String>,
 
@@ -309,10 +314,18 @@ impl CloudflarePluginConfig {
             environment,
         )?;
 
+        // R2 answers to `auto` and reads the region for the signature's sake alone, so a
+        // deployment that leaves this key out gets `auto` rather than a client that cannot sign
+        // any request at all.
+        let region = self
+            .s3_region
+            .clone()
+            .unwrap_or_else(|| DEFAULT_R2_REGION.to_string());
+
         let settings =
             R2Settings::new(bucket, R2Credentials::new(access_key_id, secret_access_key))
                 .with_endpoint_url(Some(endpoint))
-                .with_region(self.s3_region.clone())
+                .with_region(Some(region))
                 .with_force_path_style(self.s3_force_path_style)
                 .with_slow_operation_threshold_millis(self.r2_slow_operation_threshold_millis)
                 .with_timeout_millis(self.timeout_millis)
