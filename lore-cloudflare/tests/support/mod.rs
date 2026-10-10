@@ -30,7 +30,11 @@
 //! the real measurement differ only in the values handed to them (spec §5.3), so a variable that
 //! exists only in a test would be one more thing to get wrong. Without `LORE_TURSO_URL` or
 //! `LORE_R2_ENDPOINT_URL` every test in these files says it did not run and returns, so that a
-//! checkout without a server still has a green `cargo test`.
+//! checkout without a server still has a green `cargo test`. With `CI=true` it panics instead: a job
+//! that starts the servers and hands the tests their addresses has no test left to skip, so a
+//! missing variable there is a mistake in the job rather than a checkout without a server, and a
+//! green job that skipped everything it was added to run is the outcome the flag exists to stop
+//! (spec §5.2, acceptance criterion 14).
 //!
 //! The endpoints are the only thing this module makes for itself: a bucket that is not there yet is
 //! created, which on `MinIO` is every bucket the first time. Nothing is dropped afterwards — the
@@ -63,6 +67,7 @@ use std::sync::MutexGuard;
 use std::sync::OnceLock;
 
 use async_trait::async_trait;
+use libsql::Value;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::LockData;
@@ -135,6 +140,28 @@ pub fn database_url() -> Option<String> {
         .filter(|url| !url.trim().is_empty())
 }
 
+/// Whether this run is the continuous-integration one.
+///
+/// `CI=true` is what GitHub Actions sets for every job it runs. It is read rather than inferred so
+/// that a laptop run is unaffected: only a job that meant to start the servers has to have them.
+fn in_ci() -> bool {
+    std::env::var("CI").is_ok_and(|value| value.trim().eq_ignore_ascii_case("true"))
+}
+
+/// Report a test that has no server to run against, and refuse to report it quietly in CI.
+///
+/// A skip is a green test that proved nothing, which is the one outcome the job added to run these
+/// tests must not have: a mistyped variable name or a server that never came up would otherwise look
+/// exactly like a pass (spec §5.2, acceptance criterion 14).
+fn no_server(label: &str, missing: &str) {
+    assert!(
+        !in_ci(),
+        "{label}: did not run — {missing} (CI=true, so a test that skipped is a failure)"
+    );
+
+    eprintln!("{label}: did not run — {missing}");
+}
+
 /// Connect to the test server, or report that this run has none.
 ///
 /// The schema is created once per test binary: every test that starts at once would otherwise
@@ -146,8 +173,9 @@ pub async fn client(label: &str) -> Option<TursoClient> {
     install_tracing();
 
     let Some(url) = database_url() else {
-        eprintln!(
-            "{label}: did not run — set LORE_TURSO_URL to a libSQL server (see tests/support/mod.rs)"
+        no_server(
+            label,
+            "set LORE_TURSO_URL to a libSQL server (see tests/support/mod.rs)",
         );
         return None;
     };
@@ -241,10 +269,10 @@ pub async fn r2(label: &str) -> Option<Arc<dyn R2Client>> {
     install_tracing();
 
     let Some(settings) = r2_settings() else {
-        eprintln!(
-            "{label}: did not run — set LORE_R2_ENDPOINT_URL, LORE_R2_BUCKET, \
-             LORE_R2_ACCESS_KEY_ID and LORE_R2_SECRET_ACCESS_KEY to an S3 endpoint (see \
-             tests/support/mod.rs)"
+        no_server(
+            label,
+            "set LORE_R2_ENDPOINT_URL, LORE_R2_BUCKET, LORE_R2_ACCESS_KEY_ID and \
+             LORE_R2_SECRET_ACCESS_KEY to an S3 endpoint (see tests/support/mod.rs)",
         );
         return None;
     };
@@ -755,6 +783,102 @@ impl TursoExecutor for LostStatementAnswerExecutor {
         }
 
         Ok(changed)
+    }
+
+    async fn query(&self, sql: &str, parameters: TursoValues) -> Result<Vec<TursoRow>, TursoError> {
+        self.log.add(format!("query {sql}"));
+        self.inner.query(sql, parameters).await
+    }
+
+    async fn batch(&self, sql: &str) -> Result<(), TursoError> {
+        self.log.add(format!("batch {sql}"));
+        self.inner.batch(sql).await
+    }
+
+    async fn begin_immediate(&self) -> Result<Box<dyn TursoTransaction>, TursoError> {
+        self.log.add("begin immediate");
+        self.inner.begin_immediate().await
+    }
+}
+
+/// The mark another writer leaves on a state row.
+///
+/// Any value this call would not have drawn will do; a constant is what lets a test say exactly
+/// which mark the row ended up holding.
+pub const FOREIGN_MARK: [u8; 16] = [0x5a; 16];
+
+/// An executor that lets another writer take a state move first, and then reports that this one's
+/// statement never arrived.
+///
+/// This is what losing the race for a mark looks like from inside the store: the move never
+/// reached the server (so nothing of this call's is in the row), and the row is in the target state
+/// because somebody else moved it there. The answer alone cannot tell the two apart, so the row has
+/// to say whose move it holds. This executor writes the mark the statement would have written, with
+/// a mark of the other writer's, and then reports the statement as disconnected once.
+///
+/// The mark is the statement's last parameter, which is where `advance_state` puts its nonce: hash,
+/// expected state, updated state, nonce.
+pub struct ForeignMarkExecutor {
+    inner: Arc<dyn TursoExecutor>,
+    log: Arc<StatementLog>,
+    /// The statement whose move is taken, matched as a substring of the SQL.
+    needle: String,
+    taken: Mutex<bool>,
+}
+
+impl ForeignMarkExecutor {
+    pub fn new(inner: Arc<dyn TursoExecutor>, log: Arc<StatementLog>, needle: &str) -> Self {
+        Self {
+            inner,
+            log,
+            needle: needle.to_string(),
+            taken: Mutex::new(false),
+        }
+    }
+
+    /// Whether this statement is the move another writer takes first, spending the substitution.
+    fn takes_the_move(&self, sql: &str) -> bool {
+        if !sql.contains(&self.needle) {
+            return false;
+        }
+
+        let mut taken = self.taken.lock().expect("the substitution is not poisoned");
+
+        if *taken {
+            return false;
+        }
+
+        *taken = true;
+        true
+    }
+}
+
+#[async_trait]
+impl TursoExecutor for ForeignMarkExecutor {
+    async fn execute(&self, sql: &str, parameters: TursoValues) -> Result<u64, TursoError> {
+        self.log.add(format!("execute {sql}"));
+
+        if self.takes_the_move(sql) {
+            // Somebody else's move: the statement runs with a mark this call never drew, and the
+            // answer never comes back.
+            let mut foreign = parameters;
+            let mark = foreign
+                .last_mut()
+                .expect("the statement carries the mark it writes as its last parameter");
+            assert!(
+                matches!(mark, Value::Blob(_)),
+                "the last parameter of `{sql}` is not a mark"
+            );
+            *mark = Value::Blob(FOREIGN_MARK.to_vec());
+
+            self.inner.execute(sql, foreign).await?;
+
+            return Err(TursoError::disconnected(
+                "test: another writer moved the state first",
+            ));
+        }
+
+        self.inner.execute(sql, parameters).await
     }
 
     async fn query(&self, sql: &str, parameters: TursoValues) -> Result<Vec<TursoRow>, TursoError> {

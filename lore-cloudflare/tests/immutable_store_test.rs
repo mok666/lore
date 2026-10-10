@@ -32,10 +32,13 @@ use lore_base::types::Partition;
 use lore_cloudflare::R2Error;
 use lore_cloudflare::TursoExecutor;
 use lore_storage::ImmutableStore;
+use lore_storage::StoreError;
 use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
 use lore_storage::conformance::Capabilities;
 use lore_storage::conformance::verify_immutable_store;
+use support::FOREIGN_MARK;
+use support::ForeignMarkExecutor;
 use support::LostStatementAnswerExecutor;
 use support::StatementLog;
 
@@ -405,6 +408,71 @@ async fn an_obliteration_survives_a_lost_answer_to_its_mark() {
         3,
         "{:?}",
         log.take()
+    );
+}
+
+/// A mark another writer took first is not this writer's move.
+///
+/// A statement that never reached the server and one whose answer was lost look the same from
+/// here, so the store reads the row back after reissuing. What that read has to answer is whose
+/// move the row holds: another obliteration's move leaves the very state this one was trying to
+/// write, so the state alone says "somebody holds the mark" and only a nonce this call wrote makes
+/// it this call's. Without that, two obliterations both believe they hold the hash and both drain
+/// the payload (spec §4.6).
+#[tokio::test]
+async fn a_mark_another_writer_took_first_is_not_this_writers_move() {
+    let (Some(r2), Some(client)) = (
+        support::r2("a mark another writer took first").await,
+        support::client("a mark another writer took first").await,
+    ) else {
+        return;
+    };
+
+    let client = Arc::new(client);
+    let log = Arc::new(StatementLog::default());
+    let executor: Arc<dyn TursoExecutor> = Arc::new(ForeignMarkExecutor::new(
+        client.clone(),
+        log.clone(),
+        "UPDATE fragment_state",
+    ));
+    let store = support::immutable_store(r2.clone(), executor, false);
+    let (partition, address, payload, fragment) = a_fragment();
+    let key = object_key(address.hash);
+
+    put(&store, partition, address, fragment, &payload).await;
+
+    let error = store
+        .clone()
+        .obliterate(partition, address, Default::default())
+        .await
+        .expect_err("the mark belongs to another writer, so this one cannot take it");
+
+    assert!(matches!(error, StoreError::Internal(_)), "got: {error:?}");
+
+    let state = client
+        .query(
+            "SELECT state, nonce FROM fragment_state WHERE hash = ?1",
+            vec![Value::Blob(address.hash.data().to_vec())],
+        )
+        .await
+        .expect("the state row can be read");
+
+    let row = state.first().expect("the hash has a state row");
+
+    assert_eq!(
+        row[0].clone(),
+        Value::Integer(i64::from(FragmentFlags::PayloadObliterating.bits())),
+        "the state is the one both writers were moving to, which is why it cannot be the answer"
+    );
+    assert_eq!(
+        row[1].clone(),
+        Value::Blob(FOREIGN_MARK.to_vec()),
+        "the row still holds the other writer's mark, not this call's"
+    );
+
+    assert!(
+        r2.head_object(&key).await.is_ok(),
+        "the payload was left to the writer that holds the mark"
     );
 }
 
