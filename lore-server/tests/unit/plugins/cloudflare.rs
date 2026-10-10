@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore_cloudflare::R2Settings;
 use lore_cloudflare::TursoRetry;
 use lore_cloudflare::turso::DEFAULT_MAX_CONNECTIONS;
 use lore_cloudflare::turso::DEFAULT_MAX_TRANSACTION_STATEMENTS;
 use lore_cloudflare::turso::DEFAULT_TIMEOUT_MILLIS;
+use lore_server::plugins::ImmutableStorePluginFactory;
 use lore_server::plugins::LockStorePluginFactory;
 use lore_server::plugins::MutableStorePluginFactory;
 use lore_server::plugins::PluginRegistry;
@@ -28,15 +30,27 @@ fn test_mutable_store_factory_name() {
 }
 
 #[test]
+fn test_immutable_store_factory_name() {
+    let factory = CloudflareImmutableStorePluginFactory;
+    assert_eq!(factory.name(), PLUGIN_NAME);
+}
+
+#[test]
 fn test_lock_store_factory_name() {
     let factory = CloudflareLockStorePluginFactory;
     assert_eq!(factory.name(), PLUGIN_NAME);
 }
 
 #[tokio::test]
-async fn test_register_adds_the_mutable_and_lock_stores() {
+async fn test_register_adds_every_store() {
     let mut registry = PluginRegistry::new();
     register(&mut registry);
+
+    let immutable = registry.list_immutable_store_plugins();
+    assert!(
+        immutable.contains(&PLUGIN_NAME.to_string()),
+        "Expected '{PLUGIN_NAME}' in immutable store plugins, found: {immutable:?}"
+    );
 
     let mutable = registry.list_mutable_store_plugins();
     assert!(
@@ -50,13 +64,7 @@ async fn test_register_adds_the_mutable_and_lock_stores() {
         "Expected '{PLUGIN_NAME}' in lock store plugins, found: {locks:?}"
     );
 
-    // The immutable store is not part of this plugin yet, and the plugin does not register a
-    // resource detector.
-    let immutable = registry.list_immutable_store_plugins();
-    assert!(
-        !immutable.contains(&PLUGIN_NAME.to_string()),
-        "The immutable store is not implemented yet, found: {immutable:?}"
-    );
+    // The plugin does not register a resource detector.
     assert_eq!(registry.resource_detectors(Handle::current()).len(), 0);
 }
 
@@ -64,10 +72,11 @@ async fn test_register_adds_the_mutable_and_lock_stores() {
 /// stops the server instead of quietly leaving a store unconfigured.
 #[test]
 fn test_an_unknown_key_is_refused() {
-    // `s3_bucket` belongs to the immutable store, which this plugin does not provide yet.
-    let config: toml::Value = toml::from_str(r#"s3_bucket = "bucket""#).unwrap();
+    // A key of another plugin's configuration, which no Cloudflare store reads.
+    let config: toml::Value = toml::from_str(r#"dynamodb_table = "table""#).unwrap();
 
     for error in [
+        CloudflareImmutableStorePluginFactory.validate_config(&config),
         CloudflareMutableStorePluginFactory.validate_config(&config),
         CloudflareLockStorePluginFactory.validate_config(&config),
     ] {
@@ -85,7 +94,7 @@ fn test_an_unknown_key_is_refused() {
             config_error.message
         );
         assert!(
-            config_error.message.contains("s3_bucket"),
+            config_error.message.contains("dynamodb_table"),
             "the message names the key that is wrong, got: {}",
             config_error.message
         );
@@ -322,5 +331,189 @@ fn test_the_settings_the_plugin_logs_do_not_hold_the_token() {
     assert!(
         logged.contains("configured.turso.io"),
         "the host is still logged, so an operator can see which database it is, got: {logged}"
+    );
+}
+
+/// `validate_config` resolves both halves without reaching either service, so a complete
+/// configuration is accepted with nothing listening where it points.
+#[test]
+fn test_the_immutable_config_is_validated_without_reaching_a_service() {
+    let config: toml::Value = toml::from_str(
+        r#"
+        turso_url = "http://127.0.0.1:1"
+        turso_auth_token = "token"
+        s3_bucket = "bucket"
+        s3_endpoint_url = "http://127.0.0.1:1"
+        r2_access_key_id = "id"
+        r2_secret_access_key = "secret"
+        "#,
+    )
+    .unwrap();
+
+    CloudflareImmutableStorePluginFactory
+        .validate_config(&config)
+        .expect("nothing is reached until the store is created");
+}
+
+/// The R2 keys are required as well, and each error names the key and where else it could have
+/// been.
+#[test]
+fn test_the_r2_keys_are_required() {
+    // The bucket has no environment variable at all, because it is not a secret.
+    let error = resolve_r2("")
+        .expect_err("a bucket is required")
+        .as_plugin_config_error()
+        .expect("should be PluginConfigError")
+        .message
+        .clone();
+
+    assert!(error.contains("s3_bucket"), "got: {error}");
+    assert!(error.contains("[plugins.cloudflare]"), "got: {error}");
+
+    let error = resolve_r2(r#"s3_bucket = "bucket""#)
+        .expect_err("an endpoint is required")
+        .as_plugin_config_error()
+        .expect("should be PluginConfigError")
+        .message
+        .clone();
+
+    assert!(error.contains("s3_endpoint_url"), "got: {error}");
+    assert!(error.contains("LORE_R2_ENDPOINT_URL"), "got: {error}");
+
+    let error = resolve_r2(
+        r#"
+        s3_bucket = "bucket"
+        s3_endpoint_url = "https://account.r2.cloudflarestorage.com"
+        "#,
+    )
+    .expect_err("an access key id is required")
+    .as_plugin_config_error()
+    .expect("should be PluginConfigError")
+    .message
+    .clone();
+
+    assert!(error.contains("r2_access_key_id"), "got: {error}");
+    assert!(error.contains("LORE_R2_ACCESS_KEY_ID"), "got: {error}");
+
+    let error = resolve_r2(
+        r#"
+        s3_bucket = "bucket"
+        s3_endpoint_url = "https://account.r2.cloudflarestorage.com"
+        r2_access_key_id = "id"
+        "#,
+    )
+    .expect_err("a secret access key is required")
+    .as_plugin_config_error()
+    .expect("should be PluginConfigError")
+    .message
+    .clone();
+
+    assert!(error.contains("r2_secret_access_key"), "got: {error}");
+    assert!(error.contains("LORE_R2_SECRET_ACCESS_KEY"), "got: {error}");
+}
+
+/// Resolves an R2 configuration as the plugin does, with nothing in the environment.
+fn resolve_r2(configuration: &str) -> Result<R2Settings, lore_server::plugins::PluginError> {
+    let config: CloudflarePluginConfig = toml::from_str(configuration).unwrap();
+    config.resolve_r2_with(PLUGIN_NAME, &no_environment)
+}
+
+/// What the configuration holds is what the client is built from, and what it leaves out comes
+/// from the environment.
+#[test]
+fn test_the_r2_settings_come_from_the_configuration_and_the_environment() {
+    let config: CloudflarePluginConfig = toml::from_str(
+        r#"
+        s3_bucket = "bucket"
+        s3_region = "auto"
+        s3_force_path_style = false
+        r2_slow_operation_threshold_millis = 2500
+        r2_access_key_id = "configured-id"
+        "#,
+    )
+    .unwrap();
+
+    let settings = config
+        .resolve_r2_with(
+            PLUGIN_NAME,
+            &|name| match name {
+                "LORE_R2_ENDPOINT_URL" => {
+                    Some("https://account.r2.cloudflarestorage.com".to_string())
+                }
+                "LORE_R2_SECRET_ACCESS_KEY" => Some("from-the-environment".to_string()),
+                _ => None,
+            },
+        )
+        .expect("the endpoint and the secret come from the environment");
+
+    assert_eq!(settings.bucket(), "bucket");
+    assert_eq!(
+        settings.endpoint_url(),
+        Some("https://account.r2.cloudflarestorage.com")
+    );
+    assert_eq!(settings.region(), Some("auto"));
+    assert!(!settings.force_path_style());
+    assert_eq!(settings.slow_operation_threshold_millis(), 2500);
+    assert_eq!(settings.credentials().access_key_id(), "configured-id");
+    assert_eq!(
+        settings.credentials().secret_access_key(),
+        "from-the-environment"
+    );
+
+    // One timeout for the whole plugin, so that the store's two clients are bounded together.
+    assert_eq!(settings.timeout_millis(), DEFAULT_TIMEOUT_MILLIS);
+}
+
+/// The R2 keys default to the addressing `R2` and `MinIO` both answer, and the timeouts to the
+/// ones the plan gives.
+#[test]
+fn test_an_r2_configuration_without_the_optional_keys_holds_the_defaults() {
+    let settings = resolve_r2(
+        r#"
+        s3_bucket = "bucket"
+        s3_endpoint_url = "https://account.r2.cloudflarestorage.com"
+        r2_access_key_id = "id"
+        r2_secret_access_key = "secret"
+        "#,
+    )
+    .expect("every required key is supplied");
+
+    assert!(
+        settings.force_path_style(),
+        "a bucket in the path is what both R2 and MinIO answer"
+    );
+    assert_eq!(settings.region(), None);
+    assert_eq!(
+        settings.slow_operation_threshold_millis(),
+        lore_cloudflare::store::r2::DEFAULT_SLOW_OPERATION_THRESHOLD_MILLIS
+    );
+    assert_eq!(settings.timeout_millis(), DEFAULT_TIMEOUT_MILLIS);
+}
+
+/// The settings the plugin logs do not hold a key, and neither does a query string on the endpoint.
+#[test]
+fn test_the_r2_settings_the_plugin_logs_do_not_hold_a_key() {
+    let settings = resolve_r2(
+        r#"
+        s3_bucket = "bucket"
+        s3_endpoint_url = "https://account.r2.cloudflarestorage.com?signature=in-the-url"
+        r2_access_key_id = "the-access-key-id"
+        r2_secret_access_key = "the-secret-access-key"
+        "#,
+    )
+    .expect("every required key is supplied");
+
+    let logged = format!("{settings:?}");
+
+    for secret in ["the-access-key-id", "the-secret-access-key", "in-the-url"] {
+        assert!(
+            !logged.contains(secret),
+            "a secret is not in the log, got: {logged}"
+        );
+    }
+
+    assert!(
+        logged.contains("bucket"),
+        "the bucket is still logged, so an operator can see which one it is, got: {logged}"
     );
 }

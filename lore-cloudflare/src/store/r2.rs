@@ -97,6 +97,7 @@ pub struct R2Settings {
     force_path_style: bool,
     slow_operation_threshold_millis: u64,
     timeout_millis: u64,
+    http: HttpClientSettings,
 }
 
 impl R2Settings {
@@ -109,6 +110,7 @@ impl R2Settings {
             force_path_style: true,
             slow_operation_threshold_millis: DEFAULT_SLOW_OPERATION_THRESHOLD_MILLIS,
             timeout_millis: DEFAULT_TIMEOUT_MILLIS,
+            http: HttpClientSettings::default(),
         }
     }
 
@@ -134,6 +136,13 @@ impl R2Settings {
 
     pub fn with_timeout_millis(mut self, millis: u64) -> Self {
         self.timeout_millis = millis;
+        self
+    }
+
+    /// The HTTP pool and socket settings, which are the AWS plugin's own keys, so a deployment
+    /// that already tuned them for S3 keeps them for R2.
+    pub fn with_http_settings(mut self, http: HttpClientSettings) -> Self {
+        self.http = http;
         self
     }
 
@@ -163,6 +172,10 @@ impl R2Settings {
 
     pub fn timeout_millis(&self) -> u64 {
         self.timeout_millis
+    }
+
+    pub fn http_settings(&self) -> &HttpClientSettings {
+        &self.http
     }
 
     /// Reject settings that cannot work, naming the key the operator has to fix. The caller turns
@@ -224,6 +237,7 @@ impl fmt::Debug for R2Settings {
                 &self.slow_operation_threshold_millis,
             )
             .field("timeout_millis", &self.timeout_millis)
+            .field("http", &self.http)
             .finish()
     }
 }
@@ -338,10 +352,10 @@ pub async fn connect(settings: &R2Settings) -> Result<Arc<dyn R2Client>, R2Conne
         "lore-cloudflare",
     );
 
-    let http_settings = HttpClientSettings::default();
+    let http_settings = settings.http_settings();
 
     let s3 = AwsClientBuilder::builder()
-        .with_http_settings(&http_settings)
+        .with_http_settings(http_settings)
         .with_credentials_provider(SharedCredentialsProvider::new(credentials))
         .maybe_endpoint(settings.endpoint_url().map(|url| url.to_string()))
         .maybe_region(settings.region().map(|region| region.to_string()))
