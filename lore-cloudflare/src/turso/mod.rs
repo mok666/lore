@@ -380,13 +380,11 @@ async fn collect_rows(mut rows: libsql::Rows) -> Result<Vec<TursoRow>, TursoErro
     let mut collected = Vec::new();
 
     while let Some(row) = rows.next().await.map_err(TursoError::from_libsql)? {
-        let mut values = Vec::with_capacity(row.column_count());
+        let columns = usize::try_from(row.column_count()).unwrap_or(0);
+        let mut values = Vec::with_capacity(columns);
 
-        for index in 0..row.column_count() {
-            values.push(
-                row.get_value(index as i32)
-                    .map_err(TursoError::from_libsql)?,
-            );
+        for index in 0..columns {
+            values.push(row.get_value(index as i32).map_err(TursoError::from_libsql)?);
         }
 
         collected.push(values);
@@ -413,7 +411,10 @@ impl LibsqlTransaction {
     }
 
     fn take(slot: Box<Self>) -> Result<libsql::Transaction, TursoError> {
-        Box::into_inner(slot).transaction.take().ok_or_else(|| {
+        // The transaction is moved out of the box, so the slot's permit is released with it.
+        let mut slot = *slot;
+
+        slot.transaction.take().ok_or_else(|| {
             TursoError::new(
                 TursoErrorKind::Internal,
                 "the transaction has already finished",

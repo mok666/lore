@@ -12,12 +12,12 @@ pub use lock_store::CloudflareLockStore;
 pub use mutable_store::CloudflareMutableStore;
 
 use libsql::Value;
+use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_storage::KeyType;
 use lore_storage::StoreError;
 
-use crate::turso::TursoExecutor;
 use crate::turso::TursoTransaction;
 
 /// The bytes in a hash, which is how a stored hash is measured.
@@ -48,6 +48,40 @@ pub(crate) fn hash_blob(hash: &Hash) -> Value {
 
 pub(crate) fn partition_blob(partition: Partition) -> Value {
     Value::Blob(partition.data().to_vec())
+}
+
+pub(crate) fn context_blob(context: Context) -> Value {
+    Value::Blob(context.data().to_vec())
+}
+
+/// The repository and the branch as the one key a lock row is stored under.
+pub(crate) fn repository_branch_blob(repository: Partition, branch: Context) -> Value {
+    let mut bytes = Vec::with_capacity(PARTITION_LEN * 2);
+    bytes.extend_from_slice(repository.data());
+    bytes.extend_from_slice(branch.data());
+    Value::Blob(bytes)
+}
+
+/// The current time in milliseconds since the epoch, which is how a lock records when it was
+/// taken.
+pub(crate) fn now_millis() -> u64 {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+
+    u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// An integer column as a count of milliseconds since the epoch.
+pub(crate) fn integer_to_millis(column: &str, value: &Value) -> Result<u64, StoreError> {
+    match value {
+        Value::Integer(millis) => u64::try_from(*millis).map_err(|_| {
+            StoreError::internal(format!("column {column} was {millis}, which is before the epoch"))
+        }),
+        other => Err(StoreError::internal(format!(
+            "column {column} was {other:?}, not a count of milliseconds"
+        ))),
+    }
 }
 
 /// The column of a row, or an error saying the query returned a shape this build does not know.
@@ -94,6 +128,20 @@ pub(crate) fn blob_to_partition(column: &str, value: &Value) -> Result<Partition
     }
 }
 
+/// A 16-byte blob column as a branch.
+pub(crate) fn blob_to_context(column: &str, value: &Value) -> Result<Context, StoreError> {
+    match value {
+        Value::Blob(bytes) if bytes.len() == PARTITION_LEN => {
+            let mut branch = Context::default();
+            branch.data_mut().copy_from_slice(bytes);
+            Ok(branch)
+        }
+        other => Err(StoreError::internal(format!(
+            "column {column} was {other:?}, not a {PARTITION_LEN}-byte branch"
+        ))),
+    }
+}
+
 /// A blob column that holds a description or an owner, as text.
 pub(crate) fn blob_to_string(column: &str, value: &Value) -> Result<String, StoreError> {
     match value {
@@ -117,14 +165,6 @@ pub(crate) async fn discard(transaction: Box<dyn TursoTransaction>, reason: &str
             "could not roll back a transaction; the outcome being reported stands"
         );
     }
-}
-
-/// The executor a store was built on. Tests use it to reach the scripted answers.
-#[cfg(test)]
-pub(crate) fn executor_of(
-    executor: &std::sync::Arc<dyn TursoExecutor>,
-) -> &dyn TursoExecutor {
-    executor.as_ref()
 }
 
 #[cfg(test)]
@@ -175,5 +215,35 @@ mod test {
 
         let error = blob_to_partition("repository_id", &Value::Null).unwrap_err();
         assert!(format!("{error}").contains("not a 16-byte partition"));
+
+        let error = blob_to_context("branch", &Value::Integer(7)).unwrap_err();
+        assert!(format!("{error}").contains("not a 16-byte branch"));
+
+        let error = integer_to_millis("locked_at", &Value::Text("now".to_string())).unwrap_err();
+        assert!(format!("{error}").contains("not a count of milliseconds"));
+
+        let error = integer_to_millis("locked_at", &Value::Integer(-1)).unwrap_err();
+        assert!(format!("{error}").contains("before the epoch"));
+    }
+
+    #[test]
+    fn a_branch_round_trips_through_its_column() {
+        let mut branch = Context::default();
+        branch.data_mut()[0] = 3;
+
+        assert_eq!(blob_to_context("branch", &context_blob(branch)).unwrap(), branch);
+    }
+
+    #[test]
+    fn a_lock_key_is_the_repository_followed_by_the_branch() {
+        let mut repository = Partition::default();
+        repository.data_mut()[0] = 1;
+        let mut branch = Context::default();
+        branch.data_mut()[0] = 2;
+
+        let mut expected = repository.data().to_vec();
+        expected.extend_from_slice(branch.data());
+
+        assert_eq!(repository_branch_blob(repository, branch), Value::Blob(expected));
     }
 }

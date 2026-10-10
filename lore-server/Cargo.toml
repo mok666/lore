@@ -61,6 +61,7 @@ opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 lore-base = { workspace = true }
 lore-aws = { workspace = true }
+lore-cloudflare = { workspace = true }
 lore-hashicorp = { workspace = true }
 lore-storage = { workspace = true }
 lore-revision = { workspace = true }

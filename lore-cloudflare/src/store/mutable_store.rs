@@ -129,8 +129,13 @@ impl CloudflareMutableStore {
             )
         };
 
-        retry_within_deadline!(self.limits, self.executor.execute(sql, parameters))
-            .map_err(|error| error.into_store_error("storing a mutable value"))?;
+        // The macro may run the operation again, and a value that was moved into the first
+        // attempt is not there for the second, so the parameters are handed over afresh.
+        retry_within_deadline!(
+            self.limits,
+            self.executor.execute(sql, parameters.clone())
+        )
+        .map_err(|error| error.into_store_error("storing a mutable value"))?;
 
         Ok(())
     }
