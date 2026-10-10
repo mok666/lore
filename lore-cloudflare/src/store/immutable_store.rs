@@ -12,7 +12,9 @@
 //!   record that can describe different bytes.
 //! - `fragments` says which partitions hold which hashes, one row per association. It is what makes
 //!   a payload readable in a partition, and it is written last and deleted first, so a visible
-//!   association already means retrievable content.
+//!   association already means retrievable content — while an obliteration holds the hash, which is
+//!   the window when an association is visible and the bytes are about to go (see the resolution
+//!   methods below).
 //! - `fragment_state` says where a hash is in its lifecycle — stored, being obliterated, or
 //!   obliterated. It holds no representation, so it cannot disagree with the object, and it is what
 //!   answers "is this durable" in one statement without an R2 request.
@@ -449,9 +451,13 @@ impl CloudflareImmutableStore {
 
     /// The batch resolution behind [`ImmutableStoreTrait::query`].
     ///
-    /// Associations alone decide it. A put writes the association last, after the payload and the
-    /// state are in place, and an obliteration deletes it first, so an association that is visible
-    /// already means content that can be served.
+    /// The same two questions as [`Self::do_query`], asked of the whole batch: one statement for
+    /// the associations, and one for the states of the hashes they name. An association alone is
+    /// not an answer: an address can be associated and mid-obliteration, because the association
+    /// is deleted first and the payload last, and this store has no weaker level for a miss to
+    /// fall back to. Reading only the association would report a full match during that window —
+    /// bytes that are on their way out of the bucket — which is the one thing the single
+    /// resolution refuses to do.
     async fn do_query_batch(
         &self,
         partition: Partition,
@@ -460,21 +466,90 @@ impl CloudflareImmutableStore {
     ) -> Result<(), StoreError> {
         let associations = self.associations_present(partition, addresses).await?;
 
+        // Only the hashes whose association was found: an association is what makes a state matter
+        // here, and asking about the rest would be statements spent on addresses already answered.
+        let hashes: Vec<Hash> = addresses
+            .iter()
+            .filter(|address| associations.contains(*address))
+            .map(|address| address.hash)
+            .collect();
+        let states = self.load_states(&hashes).await?;
+
         for (address, result) in addresses.iter().zip(results.iter_mut()) {
-            *result = if associations.contains(address) {
-                StoreMatchResult {
-                    match_made: StoreMatch::MatchFull,
-                    partition,
-                    context: address.context,
-                    stored_local: false,
-                    stored_durable: true,
-                }
-            } else {
+            *result = if !associations.contains(address) {
                 StoreMatchResult::default()
+            } else {
+                match states.get(&address.hash).copied() {
+                    Some(FragmentState::Stored) => StoreMatchResult {
+                        match_made: StoreMatch::MatchFull,
+                        partition,
+                        context: address.context,
+                        stored_local: false,
+                        stored_durable: true,
+                    },
+                    Some(FragmentState::Obliterating | FragmentState::Obliterated) => {
+                        trace!("Query found an obliterated fragment at address {address}");
+                        StoreMatchResult::default()
+                    }
+                    None => {
+                        // The same window as in [`Self::do_query`], and reported the same way.
+                        warn!(
+                            "Query found an association at {address} whose hash has no state \
+                             recorded; reporting it as absent"
+                        );
+                        StoreMatchResult::default()
+                    }
+                }
             };
         }
 
         Ok(())
+    }
+
+    /// The lifecycle state of each of these hashes that has one.
+    ///
+    /// A batch whose associations were found needs the states of those hashes, and asking one hash
+    /// at a time would make one resolution cost a statement per address. One statement per group
+    /// of hashes instead, in the shape [`Self::associations_present`] uses.
+    async fn load_states(
+        &self,
+        hashes: &[Hash],
+    ) -> Result<HashMap<Hash, FragmentState>, StoreError> {
+        let distinct: HashSet<Hash> = hashes.iter().copied().collect();
+        if distinct.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let distinct: Vec<Hash> = distinct.into_iter().collect();
+        let mut states = HashMap::with_capacity(distinct.len());
+
+        for chunk in distinct.chunks(BATCH_ADDRESSES) {
+            // A hash is the whole key here, so one predicate per hash is enough.
+            let mut sql = String::from("SELECT hash, state FROM fragment_state WHERE ");
+            let mut parameters = Vec::with_capacity(chunk.len());
+
+            for (index, hash) in chunk.iter().enumerate() {
+                if index > 0 {
+                    sql.push_str(" OR ");
+                }
+
+                sql.push_str(&format!("hash = ?{}", index + 1));
+                parameters.push(hash_blob(hash));
+            }
+
+            let rows = self
+                .query(&sql, parameters, "reading fragment states")
+                .await?;
+
+            for row in rows {
+                states.insert(
+                    blob_to_hash("hash", cell(&row, 0, &sql)?)?,
+                    state_from_cell("state", cell(&row, 1, &sql)?)?,
+                );
+            }
+        }
+
+        Ok(states)
     }
 
     /// The lifecycle state of a hash, where a row exists.
