@@ -86,12 +86,33 @@ pub async fn with_deadline<T>(
     timeout: Duration,
     operation: impl Future<Output = Result<T, TursoError>>,
 ) -> Result<T, TursoError> {
+    within_deadline(timeout, std::convert::identity, operation).await
+}
+
+/// Fail `operation` once `timeout` has passed, naming the timeout in the errors of the store that
+/// asked for it.
+///
+/// A transactional operation cannot use [`retry_within_deadline!`]: its answer may be one the
+/// caller has to settle itself, so what it ends with is not always a [`TursoError`], and the lost
+/// answer a timeout stands for has to be turned into that caller's own error by `expired`.
+///
+/// A transaction the deadline ends is one the server may still be running, and the server holds the
+/// write lock of a transaction it has not finished. Measured against `v0.24.32`: a stream that went
+/// idle is expired and rolled back, but a request abandoned while it was in flight left the write
+/// path unanswerable for as long as it was watched — so this ends the caller's wait, not the
+/// server's work, and a server that stops answering needs restarting (see the integration tests'
+/// running notes in `tests/support/mod.rs`).
+pub async fn within_deadline<T, E>(
+    timeout: Duration,
+    expired: impl FnOnce(TursoError) -> E,
+    operation: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
     match tokio::time::timeout(timeout, operation).await {
         Ok(result) => result,
-        Err(_) => Err(TursoError::disconnected(format!(
+        Err(_) => Err(expired(TursoError::disconnected(format!(
             "operation did not finish within {}ms",
             timeout.as_millis()
-        ))),
+        )))),
     }
 }
 
@@ -207,5 +228,39 @@ mod test {
         let result =
             with_deadline(Duration::from_secs(30), async { Ok::<u8, TursoError>(7) }).await;
         assert_eq!(result.unwrap(), 7);
+    }
+
+    /// An operation with errors of its own hears about the deadline in those terms.
+    #[tokio::test]
+    async fn a_deadline_names_a_timeout_the_way_the_caller_does() {
+        let error = within_deadline(
+            Duration::from_millis(1),
+            |error| format!("gave up: {}", error.message()),
+            async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok::<(), String>(())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.starts_with("gave up: operation did not finish"),
+            "{error}"
+        );
+    }
+
+    /// The deadline does not stand between a caller and an answer it did get.
+    #[tokio::test]
+    async fn a_deadline_leaves_a_fast_failure_of_the_caller_alone() {
+        let error = within_deadline(
+            Duration::from_secs(30),
+            |error| format!("gave up: {}", error.message()),
+            async { Err::<(), String>("refused".to_string()) },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "refused");
     }
 }

@@ -7,6 +7,11 @@
 //! the query variants. Two of them are the ones the plan names as easy to get wrong — a reacquired
 //! lock is not reported as newly taken (spec §4.4), and an unlock that names a resource belonging
 //! to someone else deletes nothing at all (spec §4.5).
+//!
+//! The calls that expect a settled answer go through [`support::take_locks`] and
+//! [`support::release_locks`], which reissue a request that met another writer the way a caller
+//! does (spec §4.6). The two tests that are about a lost answer not being reissued inside one call
+//! use the store itself, because the caller's retry is what they are not about.
 #![cfg(feature = "integration_tests")]
 
 mod support;
@@ -81,8 +86,7 @@ async fn a_lock_the_owner_already_holds_is_not_taken_twice() {
     let first = random_resource();
     let second = random_resource();
 
-    let taken = store
-        .lock_resources(&owner, repository, &[first.clone(), second.clone()])
+    let taken = support::take_locks(&store, &owner, repository, &[first.clone(), second.clone()])
         .await
         .expect("the first lock is free");
 
@@ -93,10 +97,10 @@ async fn a_lock_the_owner_already_holds_is_not_taken_twice() {
         assert!(lock.locked_at > 0, "a lock says when it was taken");
     }
 
-    let taken_again = store
-        .lock_resources(&owner, repository, &[first.clone(), second.clone()])
-        .await
-        .expect("taking what is already ours succeeds");
+    let taken_again =
+        support::take_locks(&store, &owner, repository, &[first.clone(), second.clone()])
+            .await
+            .expect("taking what is already ours succeeds");
 
     assert!(
         taken_again.is_empty(),
@@ -120,15 +124,23 @@ async fn a_resource_held_by_someone_else_refuses_the_whole_request() {
     let contended = random_resource();
     let free = random_resource();
 
-    store
-        .lock_resources(&holder, repository, std::slice::from_ref(&contended))
-        .await
-        .expect("the resource is free for the first owner");
+    support::take_locks(
+        &store,
+        &holder,
+        repository,
+        std::slice::from_ref(&contended),
+    )
+    .await
+    .expect("the resource is free for the first owner");
 
-    let error = store
-        .lock_resources(&other, repository, &[free.clone(), contended.clone()])
-        .await
-        .expect_err("a resource held by someone else cannot be taken");
+    let error = support::take_locks(
+        &store,
+        &other,
+        repository,
+        &[free.clone(), contended.clone()],
+    )
+    .await
+    .expect_err("a resource held by someone else cannot be taken");
 
     assert!(
         matches!(error, LockError::LockNotOwned(_)),
@@ -161,15 +173,13 @@ async fn duplicate_resources_collapse_to_one_lock() {
 
     let resources = vec![resource.clone(), random_resource(), resource.clone()];
 
-    let taken = store
-        .lock_resources(&owner, repository, &resources)
+    let taken = support::take_locks(&store, &owner, repository, &resources)
         .await
         .expect("the resources are free");
 
     assert_eq!(taken.len(), 2, "one lock per distinct resource");
 
-    store
-        .unlock_resources(&owner, true, repository, &resources)
+    support::release_locks(&store, &owner, true, repository, &resources)
         .await
         .expect("unlocking what we hold twice succeeds");
 
@@ -201,19 +211,22 @@ async fn unlocking_a_resource_held_by_someone_else_deletes_nothing() {
     let mine = random_resource();
     let theirs = random_resource();
 
-    store
-        .lock_resources(&owner, repository, std::slice::from_ref(&mine))
+    support::take_locks(&store, &owner, repository, std::slice::from_ref(&mine))
         .await
         .expect("our own resource is free");
-    store
-        .lock_resources(&other, repository, std::slice::from_ref(&theirs))
+    support::take_locks(&store, &other, repository, std::slice::from_ref(&theirs))
         .await
         .expect("their resource is free");
 
-    let error = store
-        .unlock_resources(&owner, true, repository, &[mine.clone(), theirs.clone()])
-        .await
-        .expect_err("a resource held by someone else cannot be released");
+    let error = support::release_locks(
+        &store,
+        &owner,
+        true,
+        repository,
+        &[mine.clone(), theirs.clone()],
+    )
+    .await
+    .expect_err("a resource held by someone else cannot be released");
 
     assert!(
         matches!(error, LockError::LockNotOwned(_)),
@@ -241,15 +254,15 @@ async fn unlocking_a_resource_nobody_holds_is_not_found() {
 
     let store = support::lock_store(Arc::new(client));
 
-    let error = store
-        .unlock_resources(
-            &support::random_owner(),
-            true,
-            support::random_partition(),
-            &[random_resource()],
-        )
-        .await
-        .expect_err("there is nothing to release");
+    let error = support::release_locks(
+        &store,
+        &support::random_owner(),
+        true,
+        support::random_partition(),
+        &[random_resource()],
+    )
+    .await
+    .expect_err("there is nothing to release");
 
     assert!(
         matches!(error, LockError::LockNotFound(_)),
@@ -269,33 +282,32 @@ async fn unlocking_without_checking_the_owner_releases_what_is_there() {
     let repository = support::random_partition();
     let resource = random_resource();
 
-    store
-        .lock_resources(&owner, repository, std::slice::from_ref(&resource))
+    support::take_locks(&store, &owner, repository, std::slice::from_ref(&resource))
         .await
         .expect("the resource is free");
 
-    let released = store
-        .unlock_resources(
-            "a-different-user",
-            false,
-            repository,
-            std::slice::from_ref(&resource),
-        )
-        .await
-        .expect("an unchecked unlock does not ask who is asking");
+    let released = support::release_locks(
+        &store,
+        "a-different-user",
+        false,
+        repository,
+        std::slice::from_ref(&resource),
+    )
+    .await
+    .expect("an unchecked unlock does not ask who is asking");
 
     assert_eq!(released, vec![resource.clone()]);
     assert_eq!(holders(&store, repository, &resource).await, 0);
 
-    let released = store
-        .unlock_resources(
-            "a-different-user",
-            false,
-            repository,
-            std::slice::from_ref(&resource),
-        )
-        .await
-        .expect("releasing what is already released is not an error");
+    let released = support::release_locks(
+        &store,
+        "a-different-user",
+        false,
+        repository,
+        std::slice::from_ref(&resource),
+    )
+    .await
+    .expect("releasing what is already released is not an error");
 
     assert_eq!(released, vec![resource]);
 }
@@ -320,12 +332,10 @@ async fn the_query_variants_select_what_they_name() {
     let second = resource(support::random_context(), support::random_hash());
     let far = resource(support::random_context(), support::random_hash());
 
-    store
-        .lock_resources(&owner, repository, &[first.clone(), second.clone()])
+    support::take_locks(&store, &owner, repository, &[first.clone(), second.clone()])
         .await
         .expect("the resources are free");
-    store
-        .lock_resources(&stranger, elsewhere, std::slice::from_ref(&far))
+    support::take_locks(&store, &stranger, elsewhere, std::slice::from_ref(&far))
         .await
         .expect("the far resource is free");
 
@@ -445,8 +455,7 @@ async fn checking_a_set_reports_the_locks_that_are_there() {
     let second = random_resource();
     let third = random_resource();
 
-    store
-        .lock_resources(&owner, repository, &[first.clone(), second.clone()])
+    support::take_locks(&store, &owner, repository, &[first.clone(), second.clone()])
         .await
         .expect("the resources are free");
 
@@ -474,8 +483,7 @@ async fn checking_collapses_duplicates() {
     let repository = support::random_partition();
     let resource = random_resource();
 
-    store
-        .lock_resources(&owner, repository, std::slice::from_ref(&resource))
+    support::take_locks(&store, &owner, repository, std::slice::from_ref(&resource))
         .await
         .expect("the resource is free");
 
@@ -506,8 +514,7 @@ async fn checking_answers_past_one_chunk() {
     let resources: Vec<LockResource> = (0..51).map(|_| random_resource()).collect();
 
     for resource in &resources {
-        store
-            .lock_resources(&owner, repository, std::slice::from_ref(resource))
+        support::take_locks(&store, &owner, repository, std::slice::from_ref(resource))
             .await
             .expect("each resource is free");
     }
@@ -568,6 +575,11 @@ async fn a_lock_whose_commit_answer_was_lost_is_not_reissued() {
         "a lock is taken once: {statements:?}"
     );
     assert!(
+        statements.iter().any(|s| s == "commit"),
+        "the attempt has to reach the commit this test is about: a server that refused the write \
+         lock to it leaves nothing here to be lost: {statements:?}"
+    );
+    assert!(
         statements.last().is_some_and(|s| s == "commit"),
         "nothing may follow the commit that was lost: {statements:?}"
     );
@@ -591,10 +603,15 @@ async fn an_unlock_whose_commit_answer_was_lost_is_not_reissued() {
     let resource = random_resource();
 
     let plain: Arc<dyn TursoExecutor> = Arc::new(client);
-    support::lock_store(plain.clone())
-        .lock_resources(&owner, repository, std::slice::from_ref(&resource))
-        .await
-        .expect("the resource is free");
+    let plain_store = support::lock_store(plain.clone());
+    support::take_locks(
+        &plain_store,
+        &owner,
+        repository,
+        std::slice::from_ref(&resource),
+    )
+    .await
+    .expect("the resource is free");
 
     let log = Arc::new(StatementLog::default());
     let executor: Arc<dyn TursoExecutor> =
@@ -616,6 +633,11 @@ async fn an_unlock_whose_commit_answer_was_lost_is_not_reissued() {
         statements.iter().filter(|s| s.starts_with("begin")).count(),
         1,
         "an unlock happens once: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|s| s == "commit"),
+        "the attempt has to reach the commit this test is about: a server that refused the write \
+         lock to it leaves nothing here to be lost: {statements:?}"
     );
     assert!(
         statements.last().is_some_and(|s| s == "commit"),
@@ -644,10 +666,15 @@ async fn a_query_is_reissued_inside_its_limit_and_gives_up_beyond_it() {
     let repository = support::random_partition();
     let resource = random_resource();
 
-    support::lock_store(real.clone())
-        .lock_resources(&owner, repository, std::slice::from_ref(&resource))
-        .await
-        .expect("the resource is free");
+    let real_store = support::lock_store(real.clone());
+    support::take_locks(
+        &real_store,
+        &owner,
+        repository,
+        std::slice::from_ref(&resource),
+    )
+    .await
+    .expect("the resource is free");
 
     for failures in [1, limit, limit + 1] {
         let executor: Arc<dyn TursoExecutor> =

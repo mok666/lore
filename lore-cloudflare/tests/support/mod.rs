@@ -35,6 +35,17 @@
 //! The endpoints are the only thing this module makes for itself: a bucket that is not there yet is
 //! created, which on `MinIO` is every bucket the first time. Nothing is dropped afterwards — the
 //! content is addressed by a hash nobody else picks, so leftovers cost disk and nothing else.
+//!
+//! # When the server stops answering
+//!
+//! The pinned server can stop answering on the write path while reads keep working: measured on
+//! `v0.24.32`, twice in about twenty runs of one test binary, with `BEGIN IMMEDIATE` still
+//! unanswered minutes later, and it does not come back until the container is restarted. A run
+//! that meets it is red rather than stuck — the store bounds every transaction by `timeout_millis`
+//! (`TursoLimits::timeout`), so a request that got no answer at all becomes `SlowDown`, and the
+//! caller's retry below then gives up after the write path's own budget — and it is worth telling
+//! apart from the contention `SlowDown` the same budget is there to ride out: contention clears,
+//! and it comes with answers rather than silence. Restart `lore-sqld` and rerun.
 
 #![allow(dead_code)]
 
@@ -45,6 +56,8 @@ use std::sync::MutexGuard;
 use async_trait::async_trait;
 use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_base::types::LockData;
+use lore_base::types::LockResource;
 use lore_base::types::Partition;
 use lore_cloudflare::CloudflareImmutableStore;
 use lore_cloudflare::CloudflareImmutableStoreSettings;
@@ -63,6 +76,8 @@ use lore_cloudflare::TursoTransaction;
 use lore_cloudflare::connect_r2;
 use lore_cloudflare::turso::TursoRow;
 use lore_cloudflare::turso::TursoValues;
+use lore_revision::lock::LockError;
+use lore_revision::lock::LockStore;
 use tokio::sync::OnceCell;
 
 // =============================================================================
@@ -287,6 +302,75 @@ pub fn random_description() -> String {
 }
 
 // =============================================================================
+// The caller's retry
+// =============================================================================
+
+/// The budget a request that met another writer gets before it gives up: the numbers the write
+/// path uses for its own retries (`lore-revision`'s `RETRY_START_DURATION`, `RETRY_MAX_DURATION`
+/// and `RETRY_MAX_ATTEMPTS`).
+const RETRY_START_MILLIS: u64 = 100;
+const RETRY_MAX_MILLIS: u64 = 10_000;
+const RETRY_MAX_ATTEMPTS: usize = 10;
+
+/// Reissue an operation while the server says another client holds the write lock: a lock request
+/// hears `SlowDown` (spec §4.4), which says nothing was applied and the request can be reissued as
+/// it stands (spec §4.6).
+///
+/// Written as a macro rather than a closure because each attempt needs a fresh future that borrows
+/// the parameters, and each attempt is itself bounded by the store's `timeout_millis`, so an
+/// operation that never settles still gives up rather than hanging the test.
+macro_rules! reissue_while_busy {
+    ($operation:expr) => {{
+        let mut waiter =
+            lore_storage::retry(RETRY_START_MILLIS, RETRY_MAX_MILLIS, RETRY_MAX_ATTEMPTS);
+
+        loop {
+            match $operation.await {
+                Err(error) if error.is_slow_down() && waiter.wait().await => {
+                    eprintln!(
+                        "another client held the write lock; reissuing (attempt {})",
+                        waiter.counter()
+                    );
+                }
+                result => break result,
+            }
+        }
+    }};
+}
+
+/// Take locks the way a caller of the store does.
+///
+/// `SlowDown` is the answer a lock request gets when it meets another client's unfinished
+/// transaction: it says nothing was applied and the request can be reissued as it stands (spec
+/// §4.4, §4.6). A caller retries it — the write path in the server re-queues the fragments it
+/// could not check (`lore-server/src/grpc/handlers/branch_push.rs:854`), and the gRPC lock service
+/// reports it to the client as `RESOURCE_EXHAUSTED` to be retried for the same reason — so a test
+/// that failed on it would report whether the machine happened to be busy rather than what the
+/// store does.
+///
+/// Reads are not wrapped: the store retries a lost answer inside its own limit (spec §4.6), and
+/// the contended runs of this file failed only on the write paths.
+pub async fn take_locks(
+    store: &dyn LockStore,
+    owner_id: &str,
+    repository: Partition,
+    resources: &[LockResource],
+) -> Result<Vec<LockData>, LockError> {
+    reissue_while_busy!(store.lock_resources(owner_id, repository, resources))
+}
+
+/// Release locks the way a caller of the store does. See [`take_locks`].
+pub async fn release_locks(
+    store: &dyn LockStore,
+    owner_id: &str,
+    validate_user: bool,
+    repository: Partition,
+    resources: &[LockResource],
+) -> Result<Vec<LockResource>, LockError> {
+    reissue_while_busy!(store.unlock_resources(owner_id, validate_user, repository, resources))
+}
+
+// =============================================================================
 // Scripted executors
 // =============================================================================
 
@@ -356,11 +440,32 @@ impl TursoExecutor for LostCommitExecutor {
     }
 
     async fn begin_immediate(&self) -> Result<Box<dyn TursoTransaction>, TursoError> {
+        // One entry per request the store makes, however many attempts waiting takes: what is
+        // under test is the store opening its transaction once (spec §4.6).
         self.log.add("begin immediate");
-        let inner = self.inner.begin_immediate().await?;
+
+        // The store opens its transaction once and does not reissue it (spec §4.6), so a request
+        // the server refused the write lock to would never reach the commit this executor is here
+        // to lose. The connection waits for the lock instead, the way a caller of the store does —
+        // over the same budget, but spelled out because it is a `TursoError` underneath the store
+        // that says so rather than the `SlowDown` a caller sees.
+        let mut waiter =
+            lore_storage::retry(RETRY_START_MILLIS, RETRY_MAX_MILLIS, RETRY_MAX_ATTEMPTS);
+
+        let transaction = loop {
+            match self.inner.begin_immediate().await {
+                Err(error) if error.kind() == TursoErrorKind::SlowDown && waiter.wait().await => {
+                    eprintln!(
+                        "the transaction was refused the write lock; opening it again (attempt {})",
+                        waiter.counter()
+                    );
+                }
+                result => break result?,
+            }
+        };
 
         Ok(Box::new(LostCommitTransaction {
-            inner: Some(inner),
+            inner: Some(transaction),
             log: self.log.clone(),
         }))
     }

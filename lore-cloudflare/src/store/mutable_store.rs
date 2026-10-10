@@ -33,6 +33,7 @@ use crate::turso::TursoExecutor;
 use crate::turso::TursoLimits;
 use crate::turso::TursoRow;
 use crate::turso::retry::retry_within_deadline;
+use crate::turso::retry::within_deadline;
 
 /// How many rows one page of `list` asks for.
 ///
@@ -137,15 +138,34 @@ impl CloudflareMutableStore {
         Ok(())
     }
 
-    /// Swap a value when the current one matches, in one transaction.
+    /// Swap a value when the current one matches, inside the store's deadline.
     ///
     /// Reading the current value and writing in separate transactions would let a write between
     /// them make the decision stale, so the transaction takes the write lock at its first
-    /// statement and holds it across both.
+    /// statement and holds it across both. That lock is also why the whole of it is bounded: the
+    /// driver waits on a transaction for as long as the server does, and a swap that waited there
+    /// would be waiting on another client rather than on the database (spec §4.1).
     ///
     /// A lost `COMMIT` is not retried and the answer is not read back: another client may have
     /// written since, so the outcome is not knowable. The caller gets `Disconnected` and decides.
     async fn compare_and_swap_value(
+        &self,
+        partition: Partition,
+        key: Hash,
+        expected: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> Result<Hash, StoreError> {
+        within_deadline(
+            self.limits.timeout,
+            |error| error.into_store_error("swapping a value"),
+            self.compare_and_swap_transaction(partition, key, expected, value, key_type),
+        )
+        .await
+    }
+
+    /// Swap a value when the current one matches: one transaction, bounded by its caller.
+    async fn compare_and_swap_transaction(
         &self,
         partition: Partition,
         key: Hash,
