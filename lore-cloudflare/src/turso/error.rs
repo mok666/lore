@@ -155,26 +155,26 @@ impl TursoError {
     pub fn into_store_error(self, context: &str) -> StoreError {
         match self.kind {
             TursoErrorKind::Disconnected => {
-                tracing::warn!(message = self.message, "{context}: disconnected from Turso");
+                tracing::warn!(reason = %self.message, "{context}: disconnected from Turso");
                 StoreError::from(Disconnected)
             }
             TursoErrorKind::SlowDown => {
                 tracing::warn!(
-                    message = self.message,
+                    reason = %self.message,
                     "{context}: Turso refused the write lock"
                 );
                 StoreError::from(SlowDown)
             }
             TursoErrorKind::Maintenance => {
                 tracing::error!(
-                    message = self.message,
+                    reason = %self.message,
                     "{context}: Turso refused the request; the account needs attention"
                 );
                 StoreError::from(Maintenance)
             }
             TursoErrorKind::Internal => {
                 tracing::error!(
-                    message = self.message,
+                    reason = %self.message,
                     "{context}: unexpected Turso failure"
                 );
                 StoreError::internal_with_context(self, context)
@@ -189,21 +189,21 @@ impl TursoError {
         match self.kind {
             TursoErrorKind::Disconnected | TursoErrorKind::SlowDown => {
                 tracing::warn!(
-                    message = self.message,
+                    reason = %self.message,
                     "{context}: Turso lock request did not settle"
                 );
                 LockError::from(SlowDown)
             }
             TursoErrorKind::Maintenance => {
                 tracing::error!(
-                    message = self.message,
+                    reason = %self.message,
                     "{context}: Turso refused the request; the account needs attention"
                 );
                 LockError::internal_with_context(self, context)
             }
             TursoErrorKind::Internal => {
                 tracing::error!(
-                    message = self.message,
+                    reason = %self.message,
                     "{context}: unexpected Turso failure"
                 );
                 LockError::internal_with_context(self, context)
