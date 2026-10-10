@@ -35,6 +35,7 @@ use crate::turso::TursoExecutor;
 use crate::turso::TursoLimits;
 use crate::turso::TursoValues;
 use crate::turso::retry::retry_within_deadline;
+use crate::turso::retry::within_deadline;
 
 /// The columns every lock row is read as.
 const SELECT_LOCKS: &str = "SELECT hash, repository, branch, owner_id, description, locked_at \
@@ -70,12 +71,33 @@ impl CloudflareLockStore {
         Self { executor, limits }
     }
 
-    /// Take every resource named, or none of them.
+    /// Take every resource named, or none of them, inside the store's deadline.
+    ///
+    /// A transaction is the one thing the driver waits on for as long as the server does, and the
+    /// server holds the write lock until the transaction that took it is finished. A lock request
+    /// that meets another client's unfinished transaction therefore has to give up rather than
+    /// wait for it (spec §4.1), and it gives up with the one answer a lock request has for
+    /// "nothing was applied, try again" (spec §4.6).
+    async fn lock_resources_impl(
+        &self,
+        owner_id: &str,
+        repository: RepositoryId,
+        resources: &[LockResource],
+    ) -> Result<Vec<LockData>, LockError> {
+        within_deadline(
+            self.limits.timeout,
+            |error| error.into_lock_error("taking locks"),
+            self.lock_resources_transaction(owner_id, repository, resources),
+        )
+        .await
+    }
+
+    /// Take every resource named, or none of them: one transaction, bounded by its caller.
     ///
     /// A candidate that was already held by the same owner is not an error and is not part of the
     /// answer: the caller hears about the locks this call took, and a retry of a request whose
     /// answer was lost takes nothing and says so.
-    async fn lock_resources_impl(
+    async fn lock_resources_transaction(
         &self,
         owner_id: &str,
         repository: RepositoryId,
@@ -221,7 +243,7 @@ impl CloudflareLockStore {
         Ok(locks)
     }
 
-    /// Release every resource named, or none of them.
+    /// Release every resource named, or none of them, inside the store's deadline (spec §4.1).
     ///
     /// `validate_user` decides what a resource locked by someone else means: with it on, the
     /// whole request fails and no row is removed; with it off, the lock is released anyway, which
@@ -232,6 +254,22 @@ impl CloudflareLockStore {
     /// belongs to someone else outranks a row that is not there, as it does in the `DynamoDB`
     /// store.
     async fn unlock_resources_impl(
+        &self,
+        owner_id: &str,
+        validate_user: bool,
+        repository: RepositoryId,
+        resources: &[LockResource],
+    ) -> Result<Vec<LockResource>, LockError> {
+        within_deadline(
+            self.limits.timeout,
+            |error| error.into_lock_error("releasing locks"),
+            self.unlock_resources_transaction(owner_id, validate_user, repository, resources),
+        )
+        .await
+    }
+
+    /// Release every resource named, or none of them: one transaction, bounded by its caller.
+    async fn unlock_resources_transaction(
         &self,
         owner_id: &str,
         validate_user: bool,
