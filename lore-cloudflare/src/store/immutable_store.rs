@@ -79,9 +79,9 @@ use crate::store::cell;
 use crate::store::context_from_repository_context;
 use crate::store::hash_blob;
 use crate::store::partition_blob;
-use crate::store::repository_context_blob;
 use crate::store::r2::R2Client;
 use crate::store::r2::R2Error;
+use crate::store::repository_context_blob;
 use crate::turso::TursoExecutor;
 use crate::turso::TursoLimits;
 use crate::turso::TursoRow;
@@ -319,11 +319,8 @@ impl CloudflareImmutableStore {
     ) -> Result<u64, StoreError> {
         // The macro may run the statement again, and parameters that were moved into the first
         // attempt are not there for the second, so they are handed over afresh.
-        retry_within_deadline!(
-            self.limits,
-            self.executor.execute(sql, parameters.clone())
-        )
-        .map_err(|error| error.into_store_error(what))
+        retry_within_deadline!(self.limits, self.executor.execute(sql, parameters.clone()))
+            .map_err(|error| error.into_store_error(what))
     }
 
     /// Whether this partition holds the association for this address.
@@ -802,15 +799,19 @@ impl CloudflareImmutableStore {
     async fn head_fragment(&self, hash: Hash) -> Result<Fragment, StoreError> {
         let key = Self::object_key(hash);
 
-        let metadata = self.r2.head_object(&key).await.map_err(|error| match error {
-            R2Error::NotFound => {
-                StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
-            }
-            other => {
-                debug!(%hash, ?other, "head_fragment failed to head the object");
-                other.into_store_error("heading an R2 object")
-            }
-        })?;
+        let metadata = self
+            .r2
+            .head_object(&key)
+            .await
+            .map_err(|error| match error {
+                R2Error::NotFound => {
+                    StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
+                }
+                other => {
+                    debug!(%hash, ?other, "head_fragment failed to head the object");
+                    other.into_store_error("heading an R2 object")
+                }
+            })?;
 
         Self::fragment_from_object_metadata(hash, &metadata)
     }
@@ -819,15 +820,19 @@ impl CloudflareImmutableStore {
     async fn get_object_contents(&self, hash: Hash) -> Result<ObjectContents, StoreError> {
         let key = Self::object_key(hash);
 
-        let mut object = self.r2.get_object(&key).await.map_err(|error| match error {
-            R2Error::NotFound => {
-                StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
-            }
-            other => {
-                debug!(%hash, ?other, "get_object_contents failed to get the object");
-                other.into_store_error("reading a payload from R2")
-            }
-        })?;
+        let mut object = self
+            .r2
+            .get_object(&key)
+            .await
+            .map_err(|error| match error {
+                R2Error::NotFound => {
+                    StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
+                }
+                other => {
+                    debug!(%hash, ?other, "get_object_contents failed to get the object");
+                    other.into_store_error("reading a payload from R2")
+                }
+            })?;
 
         // The length the endpoint reported, before a single byte of the body is read. Legacy S3
         // blobs had a `Fragment` struct prepended to the payload, so the largest legitimate object
@@ -1024,11 +1029,15 @@ impl CloudflareImmutableStore {
 /// A state row's `state` column as the lifecycle state it names.
 fn state_from_cell(column: &str, value: &Value) -> Result<FragmentState, StoreError> {
     match value {
-        Value::Integer(bits) => u32::try_from(*bits)
-            .map(FragmentState::from_bits)
-            .map_err(|_out_of_range| {
-                StoreError::internal(format!("column {column} was {bits}, not a fragment state"))
-            }),
+        Value::Integer(bits) => {
+            u32::try_from(*bits)
+                .map(FragmentState::from_bits)
+                .map_err(|_out_of_range| {
+                    StoreError::internal(format!(
+                        "column {column} was {bits}, not a fragment state"
+                    ))
+                })
+        }
         other => Err(StoreError::internal(format!(
             "column {column} was {other:?}, not a fragment state"
         ))),

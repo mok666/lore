@@ -12,9 +12,9 @@ pub mod lock_store;
 pub mod mutable_store;
 pub mod r2;
 
-use libsql::Value;
 pub use immutable_store::CloudflareImmutableStore;
 pub use immutable_store::CloudflareImmutableStoreSettings;
+use libsql::Value;
 pub use lock_store::CloudflareLockStore;
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -316,8 +316,9 @@ mod test {
             context
         );
 
-        let error = context_from_repository_context("repository_context", &hash_blob(&Hash::default()))
-            .unwrap_err();
+        let error =
+            context_from_repository_context("repository_context", &hash_blob(&Hash::default()))
+                .unwrap_err();
         assert!(format!("{error}").contains("repository and context"));
     }
 }
