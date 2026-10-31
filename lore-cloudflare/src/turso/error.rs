@@ -359,7 +359,7 @@ mod test {
     fn anything_else_is_internal() {
         for message in [
             "API misuse: `connection is closed`",
-            "syntax error around L1:7: `near \"SELCT\": syntax error`",
+            "syntax error around L1:7: `near \"FROB\": syntax error`",
         ] {
             assert_eq!(
                 TursoError::classify(message),
