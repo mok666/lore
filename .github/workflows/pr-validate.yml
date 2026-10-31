@@ -71,10 +71,10 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --verbose
 
-  # Runs the integration tests against the MinIO, DynamoDB Local, and Consul
-  # services that Docker Compose starts. Only the Linux runners provide Docker.
-  # The tests connect to 127.0.0.1 on ports 9000, 9090, and 8500, which the
-  # compose file maps.
+  # Runs the integration tests against the MinIO, DynamoDB Local, Consul, and
+  # libSQL services that Docker Compose starts. Only the Linux runners provide
+  # Docker. The tests connect to 127.0.0.1 on ports 9000, 9090, 8500, and 8080,
+  # which the compose file maps.
   integration:
     name: integration (linux-x86_64)
     runs-on: ubuntu-latest
@@ -99,7 +99,7 @@ jobs:
         with:
           key: integration
 
-      - name: Start backing services (MinIO, DynamoDB Local, Consul)
+      - name: Start backing services (MinIO, DynamoDB Local, Consul, libSQL)
         run: docker compose --file lore-integration-tests/compose.yaml up --detach
 
       - name: Wait for services to be ready
@@ -107,7 +107,10 @@ jobs:
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:9000/minio/health/ready \
                && curl -sf http://127.0.0.1:8500/v1/status/leader \
-               && curl -s -o /dev/null http://127.0.0.1:9090; then
+               && curl -s -o /dev/null http://127.0.0.1:9090 \
+               && curl -sf -X POST http://127.0.0.1:8080/v2/pipeline \
+                    -H 'content-type: application/json' \
+                    -d '{"requests":[{"type":"execute","stmt":{"sql":"SELECT 1"}}]}' > /dev/null; then
               echo "services ready"
               exit 0
             fi
@@ -124,6 +127,21 @@ jobs:
           AWS_REGION: us-east-1
         run: >
           cargo test --package lore-integration-tests
+          --features integration_tests --verbose
+
+      # The Cloudflare plugin's stores run against the same MinIO and the libSQL
+      # service. The variables are the ones the plugin resolves, so the CI job
+      # rehearses the configuration a deployment uses; the bucket the tests
+      # address is made by them, so MinIO needs nothing set up (spec §5.2, §5.3).
+      - name: cargo test (integration, lore-cloudflare)
+        env:
+          LORE_TURSO_URL: http://127.0.0.1:8080
+          LORE_R2_ENDPOINT_URL: http://127.0.0.1:9000
+          LORE_R2_BUCKET: lore-immutable-store-test
+          LORE_R2_ACCESS_KEY_ID: lorelocal
+          LORE_R2_SECRET_ACCESS_KEY: lorelocal
+        run: >
+          cargo test --package lore-cloudflare
           --features integration_tests --verbose
 
       - name: Dump service logs on failure
